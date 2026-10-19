@@ -523,7 +523,7 @@ fun StrictChip(label: String, value: String, c: RafiqController, modifier: Modif
             .clip(shape)
             .background(if (selected) Gold else Bg)
             .border(1.dp, Gold.copy(alpha = 0.6f), shape)
-            .clickable { c.setStrictness(value) }
+            .clickable { c.changeStrictness(value) }
             .padding(vertical = 8.dp)
     ) {
         Text(

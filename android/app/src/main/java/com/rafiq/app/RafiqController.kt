@@ -288,7 +288,7 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
         return Summary(ok, ta, tj, le, un, ok + ta + tj + le + un, words.size)
     }
 
-    fun setStrictness(value: String) {
+    fun changeStrictness(value: String) {
         RecitationConfig.saveStrictness(appContext, value)
         strictness = value
     }
