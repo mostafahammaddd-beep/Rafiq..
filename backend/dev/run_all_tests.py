@@ -25,7 +25,8 @@ def kinds(w): return [i["k"] for i in w.get("issues", [])]
 
 # ---------------------------------------------------------------- reference building
 check("reference: 50 words, stop sign ignored, exact segmentation", ref.n == 50 and not ref.approx)
-check("reference: waqf forms computed", sum(1 for w in ref.waqf if w) >= 45)
+check("reference: stop (waqf) forms computed for words that end in a vowel/tanween",
+      ref.info["waqf_forms"] >= 20 and ref.waqf[9] and ref.waqf[11], ref.info.get("waqf_forms"))
 
 # ---------------------------------------------------------------- clean recitation
 eng, log, final, sp = sim.run_stream(ref, sim.Speech(ref, BASE, pauses=PAUSES, seed=3))
@@ -55,7 +56,66 @@ for preset in ("balanced", "strict"):
     check("errors/%s: zero false positives" % preset, set(got) == set(exp), set(got) - set(exp))
 spoken, exp = inject(BASE)
 eng, log, final, sp = sim.run_stream(ref, sim.Speech(ref, spoken, pauses=PAUSES, seed=5), preset="relaxed")
-check("errors/relaxed: tolerates the dropped madd that balanced reports", 15 not in flagged(final))
+bal_, rel_, str_ = M.get_preset("balanced"), M.get_preset("relaxed"), M.get_preset("strict")
+def mk(exp, seg, p): return [i.k for i in M.judge_word([exp], seg, None, p)[0]]
+nat = "سَمَااوَاتِ"
+check("madd natural: exact 2 ok everywhere", all(mk(nat, nat, p) == [] for p in (bal_, rel_, str_)))
+check("madd natural shortened to 1: balanced+strict flag, relaxed tolerates",
+      mk(nat, nat.replace("اا", "ا", 1), bal_) == ["madd_short"] and mk(nat, nat.replace("اا", "ا", 1), str_) == ["madd_short"]
+      and mk(nat, nat.replace("اا", "ا", 1), rel_) == [])
+check("madd natural stretched to 3: only strict flags; to 4: balanced flags too; relaxed tolerates 4",
+      mk(nat, nat.replace("اا", "ااا", 1), bal_) == [] and mk(nat, nat.replace("اا", "ااا", 1), str_) == ["madd_long"]
+      and mk(nat, nat.replace("اا", "اااا", 1), bal_) == ["madd_long"] and mk(nat, nat.replace("اا", "اااا", 1), rel_) == [])
+check("madd dropped entirely is flagged in every preset", all(mk(nat, nat.replace("اا", "", 1), p) == ["madd_dropped"] for p in (bal_, rel_, str_)))
+mut = "شَااااءَ"
+check("madd muttasil: 4 ok, 2 flagged (4 harakat needed)", mk(mut, mut, bal_) == [] and mk(mut, "شَااءَ", bal_) == ["madd_short"])
+
+# ---- the two real mistakes seen in the live log (QPS uses ۦ for kasra-madd): must read as ONE tashkeel issue
+iss = M.judge_word(["لمِهِۦۦۦۦ"], "لمِهَاا", None, str_)[0]
+check("live log w36 (هِۦ said as هَا): a single yellow tashkeel issue, no confusing tajweed/letters note",
+      [i.t for i in iss] == ["tashkeel"] and iss[0].k == "vowel_swap", [(i.t, i.k) for i in iss])
+iss = M.judge_word(["اشَااااءَ"], "اشِۦۦۦۦءَ", None, str_)[0]
+check("live log w39 (شَاءَ said as شِيء): single tashkeel issue", [i.t for i in iss] == ["tashkeel"], [(i.t, i.k) for i in iss])
+iss = M.judge_word(["بِمَاا"], "بِمَۦۦ", None, str_)[0]
+check("madd letter swapped alone (ا -> ۦ) is reported as tashkeel 'madd_vowel_swap' with Arabic names",
+      [(i.t, i.k) for i in iss] == [("tashkeel", "madd_vowel_swap")] and "الياء" in iss[0].n and "الألف" in iss[0].n, [(i.t, i.k) for i in iss])
+iss = M.judge_word(["بِمَاا"], "بِمَيي", None, str_)[0]
+check("madd alif said as a real ya is a letters error", [(i.t, i.k) for i in iss] == [("letters", "replace")], [(i.t, i.k) for i in iss])
+
+# ---- segmentation ladder: the library's spaced output may misbehave in several ways
+def bounds(r): return r.starts
+for mode in ("none", "waqf_all", "merge"):
+    r2 = M.build_ref_aya(2, 255, sim.FakeLib(spaced=mode))
+    drift = max(abs(a - b) for a, b in zip(bounds(r2), bounds(ref)))
+    want = ("spaced+aligned",) if mode == "merge" else ("aligned",)
+    check("ladder/%s: spaced output unusable/merged -> %s segmentation, boundaries within 2 chars" % (mode, want[0]),
+          r2.info["segmentation"] in want and drift <= 2 and r2.n == 50, (r2.info.get("segmentation"), drift))
+    check("ladder/%s: no word starts with a vowel mark or silah letter (leaked-vowel artefact)" % mode,
+          all(not M.is_mark(f[0]) and f[0] not in "ۥۦ" for f in r2.wasl), [f[:3] for f in r2.wasl if M.is_mark(f[0]) or f[0] in "ۥۦ"])
+    check("ladder/%s: stop forms still found" % mode, r2.info.get("waqf_forms", 0) >= 15, r2.info.get("waqf_forms"))
+    eng, log, final, sp = sim.run_stream(r2, sim.Speech(ref, BASE, pauses=PAUSES, seed=3), preset="strict")
+    check("ladder/%s: clean recitation -> 50 ok, none flagged (strict)" % mode,
+          final["summary"]["ok"] == 50 and not flagged(final), (final["summary"], list(flagged(final))[:6]))
+    spoken, exp = inject(BASE)
+    eng, log, final, sp = sim.run_stream(r2, sim.Speech(ref, spoken, pauses=PAUSES, seed=5), preset="strict")
+    got = flagged(final)
+    check("ladder/%s: the 6 injected mistakes are still found (strict), no extras" % mode,
+          set(got) == set(exp) and all(got[w]["s"] == e[0] for w, e in exp.items()),
+          {w: got[w]["s"] if w in got else None for w in exp} | {"extra": sorted(set(got) - set(exp))})
+r_adopt = M.build_ref_aya(2, 255, sim.FakeLib(spaced="ok"))
+check("ladder/ok: exact spaced segmentation is preferred", r_adopt.info["segmentation"] == "spaced-exact")
+
+# ---- stop-form without a stop: silence in the audio decides
+def waqf_case(preset, pause):
+    spoken = list(BASE); spoken[9] = ref.waqf[9]            # سِنَةٌ said in stop form
+    p = set(PAUSES) | ({9} if pause else set()); p = p - ({9} if not pause else set())
+    eng, log, final, sp = sim.run_stream(ref, sim.Speech(ref, spoken, pauses=p, seed=7), preset=preset)
+    return flagged(final)
+g = waqf_case("strict", pause=False)
+check("waqf without a pause: strict flags the dropped final vowel (yellow)",
+      list(g) == [9] and g[9]["s"] == "tashkeel" and kinds(g[9]) == ["waqf_no_pause"], {w: (g[w]["s"], kinds(g[w])) for w in g})
+check("waqf WITH a real pause: strict does not flag", waqf_case("strict", pause=True) == {})
+check("waqf without a pause: balanced does not flag (default stays conservative)", waqf_case("balanced", pause=False) == {})
 
 # ---------------------------------------------------------------- robustness (all must be clean)
 cases = {
@@ -126,6 +186,58 @@ check("sifat: light ر reported as tafkheem error", set(g) == {18, 41, 43}, list
 g = sifat_run("relaxed", lambda lv, l, lab: "moraqaq" if (lv == "tafkheem_or_taqeeq" and l == "ر") else lab)
 check("sifat: relaxed ignores tafkheem", not g)
 
+
+# ---- regression tests built from the REAL strings in the live report
+real_groups = ["ءَللَااهُ", "لَاااا", "ءِلَااهَ", "ءِللَاا", "هُوَ", "لحَييُ", "لقَييُۥۥمُ", "لَاا", "تَءخُذُهُۥۥ", "سِنَتُوووَلَاا"]
+real_F = "".join(real_groups)
+gs, acc = [], 0
+for gr in real_groups[:-1]:
+    acc += len(gr); gs.append(acc)
+est = [0] + [g + (1 if i % 2 == 0 else -1) for i, g in enumerate(gs)] + [len(real_F)]    # +-1 estimation noise
+snapped, exact = M._snap_to_library_groups(est, gs)
+check("real log: estimated boundaries snap to the library's exact group edges",
+      snapped[1:-1] == gs and all(exact[1:-1]), (snapped, gs))
+leak = "كُرسِييُهُ" + "لسسَمَااوَاتِ"
+b = [0, len("كُرسِييُه"), len(leak)]                    # boundary placed BEFORE the final damma (real artefact)
+check("real log: a final vowel mark never leaks into the next word", M.refine_bounds(leak, b)[1] == len("كُرسِييُهُ"), M.refine_bounds(leak, b))
+leak2 = "هُوَ" + "لعَلِييُ"
+check("real log: silah/madd letters stay with the previous word",
+      M.refine_bounds("هُو" + "ۥۥ" + "لحَييُ", [0, 3, 9])[1] == 5)
+
+# ---- shaddah / ghunna length strictness (junction 'ووو' = idgham with ghunna)
+junction = "سِنَتُوووَلَاا"
+def jk(seg, p): return [i.k for i in M.judge_word([junction], seg, None, M.get_preset(p))[0]]
+check("ghunna/shaddah run: exact length ok everywhere", all(jk(junction, p) == [] for p in ("relaxed", "balanced", "strict")))
+check("ghunna/shaddah run: one unit short -> strict flags, balanced+relaxed tolerate",
+      jk("سِنَتُووَلَاا", "strict") == ["shaddah_dropped"] and jk("سِنَتُووَلَاا", "balanced") == [] and jk("سِنَتُووَلَاا", "relaxed") == [])
+check("ghunna/shaddah run: nearly gone -> balanced and strict flag",
+      jk("سِنَتُوَلَاا", "balanced") == ["shaddah_dropped"] and jk("سِنَتُوَلَاا", "strict") == ["shaddah_dropped"])
+
+# ---- tolerant sifat mapping (22 % of real windows had pred_mapped=false)
+grp = [{"g": "ءَ"}, {"g": "لل"}, {"g": "َا"}]
+m = M.tolerant_group_map(grp, "ءَللَِا")
+check("sifat mapping: survives a doubled vowel mark at a window edge", m == [0, 0, 1, 1, 2, 2, 2], m)
+check("sifat mapping: refuses unrelated text", M.tolerant_group_map(grp, "بتثجحخدذرزسشص") is None)
+
+# ---- [PAD] labels (prob 0.0, seen in the live report) must never produce a flag
+def sifat_pad(preset):
+    sp = sim.Speech(ref, BASE, pauses=PAUSES, seed=5); holder = {}; plain = sp.recognizer(holder)
+    def rec(wave):
+        r = plain(wave); items = []
+        for g in sim.fake_groups(r.text):
+            items.append({"phonemes_group": g.phonemes,
+                          "tafkheem_or_taqeeq": types.SimpleNamespace(text="[PAD]", prob=0.0),
+                          "qalqla": types.SimpleNamespace(text="[PAD]", prob=0.0),
+                          "ghonna": types.SimpleNamespace(text="[PAD]", prob=0.0)})
+        return M.Recognition(r.text, r.probs, M.convert_sifat(items))
+    eng = M.SessionEngine(ref, rec, M.get_preset(preset)); holder["engine"] = eng
+    t = 0.0
+    while t < sp.total and not eng.complete:
+        eng.add_audio(sp.audio[int(t * M.SR): int((t + 0.1) * M.SR)]); t += 0.1
+        if eng.ready_to_run(): eng.step()
+    return flagged(eng.flush())
+check("sifat: [PAD] / prob 0.0 predictions never flag a word", sifat_pad("strict") == {})
+
 # ---------------------------------------------------------------- real WebSocket handler with a fake socket
 fa = types.ModuleType("fastapi")
 class FastAPI:
@@ -184,6 +296,9 @@ async def ws_all():
     kinds_ = [m["type"] for m in ws.sent]
     check("websocket: ready -> progress... -> final(50 ok, complete) -> closed, no errors",
           kinds_[0] == "ready" and len(fin) == 1 and fin[0]["summary"]["ok"] == 50 and ws.closed and "error" not in kinds_, fin[:1])
+    ws, fin = await ws_case(14.0)
+    check("websocket: the final message carries the debug trace (server may scale to zero afterwards)",
+          "debug" in fin[0] and "ref_info" in fin[0]["debug"] and len(fin[0]["debug"]["steps"]) > 0)
     ws, fin = await ws_case(14.0)
     check("websocket: stop button -> final with judged words, then closed", len(fin) == 1 and 15 <= fin[0]["summary"]["judged"] <= 24 and ws.closed, fin[:1])
     await ws_abrupt(); check("websocket: abrupt network drop ends the handler cleanly", True)

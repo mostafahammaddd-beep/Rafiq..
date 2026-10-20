@@ -62,21 +62,42 @@ def fake_ph(word: str, final: bool = False) -> str:
     return s
 
 
+def lib_word(w: str, final: bool, initial: bool) -> str:
+    """Like the real library: the hamza of 'ال' is pronounced only when the text starts there
+    (isolated word / first word); in the middle of a verse it disappears (hamzat al-wasl)."""
+    if w.startswith("ال"):
+        body = fake_ph(w[1:], final)
+        return ("ءَ" + body) if initial else body
+    return fake_ph(w, final)
+
+
 class FakeLib:
-    def __init__(self, with_stop_token=True):
+    """spaced: how the fake library's remove_spaces=False output misbehaves
+       ok | none (no spaces) | waqf_all (every word in stop form) | merge (two words glued)"""
+    def __init__(self, with_stop_token=True, spaced="ok"):
         self.with_stop = with_stop_token
+        self.spaced = spaced
 
     def get_uthmani(self, s, a):
         toks = list(WORDS)
         if self.with_stop:
-            toks.insert(7, "ۚ")            # standalone stop sign must be ignored
+            toks.insert(7, "\u06da")          # standalone stop sign must be ignored
         return " ".join(toks)
 
     def phonetize(self, text, remove_spaces):
         toks = [t for t in text.split() if M._BASE_RE.search(t)]
-        words = [fake_ph(w, final=(i == len(toks) - 1)) for i, w in enumerate(toks)]
-        ph = "".join(words) if remove_spaces else " ".join(words)
-        groups = fake_groups(ph) if remove_spaces else None
+        words = [lib_word(w, i == len(toks) - 1, i == 0) for i, w in enumerate(toks)]
+        if remove_spaces:
+            ph = "".join(words)
+        elif self.spaced == "none":
+            ph = "".join(words)
+        elif self.spaced == "waqf_all":
+            ph = " ".join(lib_word(w, True, i == 0) for i, w in enumerate(toks))
+        elif self.spaced == "merge" and len(words) > 7:
+            ws = list(words); ws[5:7] = [ws[5] + ws[6]]; ph = " ".join(ws)
+        else:
+            ph = " ".join(words)
+        groups = fake_groups("".join(words)) if remove_spaces else None
         return types.SimpleNamespace(phonemes=ph, sifat=groups)
 
 

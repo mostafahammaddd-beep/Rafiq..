@@ -65,6 +65,9 @@ object RecitationConfig {
         return "$wsBase/ws/live-recitation?sura_idx=$SURA_IDX&aya_idx=$AYA_IDX&strictness=$strictness"
     }
 
+    /** Modal bills per second of server uptime: do not wake the server just because the app opened. */
+    fun isMetered(ctx: Context): Boolean = getServerBaseUrl(ctx).contains("modal.run")
+
     fun healthUrl(ctx: Context): String = getServerBaseUrl(ctx) + "/health"
 
     fun debugUrl(ctx: Context): String = getServerBaseUrl(ctx) + "/debug/last?steps=30"

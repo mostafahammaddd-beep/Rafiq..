@@ -40,7 +40,7 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
 
     var stage by mutableStateOf(Stage.IDLE)
         private set
-    var serverState by mutableStateOf(0)          // 0 تجهيز، 1 جاهز، 2 غير متاح
+    var serverState by mutableStateOf(0)          // 0 تجهيز، 1 جاهز، 2 غير متاح، 3 نائم (وضع التوفير)
         private set
     var connection by mutableStateOf(0)           // 0 اتصال، 1 متصل، 2 إعادة اتصال
         private set
@@ -71,9 +71,16 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
     private var pace = 1.3                  // كلمة/ثانية (تُقدَّر أثناء التلاوة)
     private var silentMs = 0
     private var smoothedLevel = 0f
+    private var lastDebug = ""
+    private val reports = ArrayList<String>()
     private val finalTimeout = Runnable { onFinalTimeout() }
 
     // ------------------------------------------------------------------ تجهيز الخادم
+
+    /** وضع التوفير: الخادم المدفوع بالثانية يبقى نائماً حتى يطلب المستخدم إيقاظه. */
+    fun markSleeping() {
+        serverState = 3
+    }
 
     fun warmUp() {
         if (warming || released) return
@@ -83,18 +90,20 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
         Thread {
             var ok = false
             var tries = 0
-            while (!ok && tries < 6 && !released) {
+            while (!ok && tries < 120 && !released) {
                 try {
                     val client = Net.client.newBuilder().readTimeout(120, TimeUnit.SECONDS).build()
                     client.newCall(Request.Builder().url(url).build()).execute().use { r ->
                         val body = r.body?.string() ?: ""
-                        ok = r.isSuccessful && JSONObject(body).optString("status") == "ok"
+                        val st = JSONObject(body).optString("status")
+                        ok = r.isSuccessful && st == "ok"
+                        if (st == "error") tries = 1000
                     }
                 } catch (e: Exception) {
                     ok = false
                 }
                 tries++
-                if (!ok && !released) {
+                if (!ok && !released && tries < 120) {
                     try {
                         Thread.sleep(2500)
                     } catch (_: InterruptedException) {
@@ -106,6 +115,10 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
                 if (!released) serverState = if (ok) 1 else 2
             }
         }.start()
+    }
+
+    private fun afterSession() {
+        if (RecitationConfig.isMetered(appContext)) serverState = 3
     }
 
     // ------------------------------------------------------------------ التلاوة
@@ -122,7 +135,7 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
         session = s
         stage = Stage.LISTENING
         glow = 0
-        message = if (serverState == 1) "تفضّل بالتلاوة…" else "الخادم يستيقظ… ابدأ التلاوة وسنلحق بك"
+        message = if (serverState == 1) "تفضّل بالتلاوة…" else "الخادم يستيقظ (حتى نصف دقيقة)… ابدأ التلاوة وسنلحق بك"
     }
 
     fun stopRecitation() {
@@ -169,6 +182,7 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
         session = null
         stage = Stage.DONE
         glow = -1
+        afterSession()
         message = "تأخّر الخادم في إرسال التقرير الكامل؛ هذه النتائج التي وصلت حتى الآن."
     }
 
@@ -224,8 +238,10 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
         stopRecitation()
     }
 
-    override fun onFinal(words: List<WordResult>, complete: Boolean) {
+    override fun onFinal(words: List<WordResult>, complete: Boolean, debug: String) {
         main.removeCallbacks(finalTimeout)
+        if (debug.isNotEmpty()) lastDebug = debug
+        afterSession()
         applyUpdates(words)
         session = null
         stage = Stage.DONE
@@ -246,6 +262,7 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
         stage = if (summary().judged > 0) Stage.DONE else Stage.IDLE
         level = 0f
         glow = -1
+        afterSession()
         this.message = message
     }
 
@@ -303,6 +320,18 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
     fun retryServer() {
         warming = false
         warmUp()
+    }
+
+    /** المستخدم يخبرنا أن حكم الخادم على كلمة كان خاطئاً: kind = missed | wrong_flag */
+    fun reportWord(index: Int, kind: String) {
+        val r = results.getOrNull(index)
+        val o = JSONObject()
+        o.put("word_index", index)
+        o.put("word", words.getOrElse(index) { "" })
+        o.put("shown_status", r?.status ?: "")
+        o.put("user_says", if (kind == "missed") "has_an_undetected_mistake" else "was_recited_correctly")
+        reports.add(o.toString())
+        message = "سُجّلت ملاحظتك على الكلمة ✓ (ستُضاف للتقرير الفني)"
     }
 
     // ------------------------------------------------------------------ استماع التلاوة المرجعية
@@ -365,6 +394,13 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
     // ------------------------------------------------------------------ تقرير فني (للتشخيص)
 
     fun copyDebugReport() {
+        val userReports = "[" + reports.joinToString(",") + "]"
+        val stored = lastDebug
+        if (stored.isNotEmpty()) {
+            copyToClipboard("{\"user_reports\":" + userReports + ",\"session\":" + stored + "}")
+            message = "تم نسخ التقرير الفني. الصقه في المحادثة."
+            return
+        }
         message = "جارٍ جلب التقرير الفني…"
         val url = RecitationConfig.debugUrl(appContext)
         Thread {
@@ -380,13 +416,17 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
             val result = text
             main.post {
                 if (result == null) {
-                    message = "تعذّر جلب التقرير الفني."
+                    message = "تعذّر جلب التقرير الفني. أكمل تلاوة أولاً ثم أعد المحاولة."
                 } else {
-                    val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    cm.setPrimaryClip(ClipData.newPlainText("rafiq-report", result))
+                    copyToClipboard("{\"user_reports\":" + userReports + ",\"session\":" + result + "}")
                     message = "تم نسخ التقرير الفني. الصقه في المحادثة."
                 }
             }
         }.start()
+    }
+
+    private fun copyToClipboard(text: String) {
+        val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("rafiq-report", text))
     }
 }

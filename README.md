@@ -1,43 +1,45 @@
-# رَفِيق — Rafiq v14 (Quran recitation corrector)
+# رَفِيق — Rafiq v14.2
 
-Recite Ayat al-Kursi → every word turns **green** (correct), **yellow** (tashkeel / vowel),
-**orange** (tajweed) or **red** (letters / skipped word). Tap a coloured word to read a short Arabic
-note that explains the mistake and how to say it correctly.
+Recite Ayat al-Kursi → every word turns **green** (correct), **yellow** (tashkeel), **orange** (tajweed)
+or **red** (letters / skipped word). Tap a coloured word for a short Arabic note.
 
-## 1. Deploy the server (Windows CMD)
+## 1. Deploy / update the server (Windows CMD)
 ```
-cd Rafiq\backend
+cd backend
 py -m pip install modal numpy
 py -m modal deploy modal_app.py
 ```
-The URL stays the same as before (same app name), so the phone app needs no setup.
-The first deploy after this update rebuilds the image (a few minutes). Cold start of the server
-takes about 30–60 s; the app wakes the server the moment you open it and shows "الخادم جاهز" when ready.
+Same URL as before. Push the whole folder to GitHub to rebuild the APK (it updates the installed app).
 
-## 2. Build the phone app
-Push the whole `Rafiq` folder to GitHub → *Actions* → **Build APK** → download the `Rafiq-APK`
-artifact (or the release) and install it. It is signed with the same debug key, so it updates your
-current app in place.
+## 2. Stop burning Modal credit (what changed)
+Modal bills about **$0.000123 per second** for the old setup (8 cores + 8 GB). The old settings kept the
+server alive 5 minutes after every use **and** woke it every time the app opened, i.e. about $0.037 of pure
+idle per app opening. Now: 4 cores, 4 GB, sleeps after 10 s, and **the app no longer wakes the server by
+itself**. The chip says "⏸ الخادم نائم": tap it (or press the mic) when you actually want to recite; the first
+start takes up to ~30 s. One whole session costs about **$0.006** (roughly 6× less, and $0 for just opening the app).
 
-## 3. Using it
-Open the app, wait for **● الخادم جاهز**, press 🎤, recite from the start of the verse, press ⏹ when done
-(it also finishes by itself when you complete the verse). 🔊 plays a reference recitation.
-⚙ → *Accuracy*: **متساهل** (forgiving) · **متوازن** (default) · **صارم** (strict).
+## 3. Free plan B: run the same server on your own PC
+```
+cd backend
+py -m pip install -r requirements-local.txt
+py run_local.py                      (window 1)
+cloudflared tunnel --url http://localhost:8000      (window 2; download cloudflared from GitHub, no account)
+```
+Paste the printed `https://….trycloudflare.com` address in the app: ⚙ → رابط الخادم. Free, supports one or a few
+people at a time, the address changes each run, the PC must stay on. (For addresses containing `modal.run`
+the app uses the sleeping/economy behaviour; for any other address it connects immediately.)
 
-## 4. If a word is marked wrongly
-⚙ → **نسخ تقرير فني** copies a technical report of the last session. Paste it to your developer/assistant:
-it shows exactly what the model heard and why each word was flagged, so the rules can be tuned.
-You can also open `<your-url>/health` and `<your-url>/debug/ref` in a browser.
+## 4. Telling me what is wrong (this is how accuracy gets fixed)
+* Tap a **green** word → **⚠ فيها خطأ لم يُكتشف** if you know you made a mistake there.
+* Tap a **coloured** word → **✔ نطقتها صحيحة** if you said it right.
+* ⚙ → **نسخ تقرير فني** copies those notes plus what the model heard, word by word. Paste it in the chat.
 
-## 5. Switches at the top of `backend/modal_app.py`
-| Setting | Meaning |
-|---|---|
-| `PRECISION = "auto"` | Measures the CPU at start-up. Uses faster int8 maths only if full precision is too slow. `"fp32"` forces full precision. |
-| `USE_GPU = False` | Set `True` only after Modal accepts a card (T4 GPU ≈ 10× faster, same code). |
+## 5. On-device feasibility probe (the only route to $0 for any number of users)
+Run workflow **Build Probe APK** on GitHub (Actions tab → Run workflow), install `Rafiq-Probe-APK`, follow the
+3 buttons (Wi-Fi recommended, 876 MB download), and send me the copied result. It does not touch the main app.
 
 ## 6. Honest limits
-* No model can be "100 % reliable". Wrong-sounding detection of subtle tajweed (madd length, tafkheem,
-  qalqalah) depends on the muaalem model's confidence; the app only reports what the model is sure about,
-  and "متساهل/متوازن/صارم" controls how sure it must be.
-* Works for Ayat al-Kursi (the engine itself accepts any ayah: `?sura_idx=&aya_idx=`).
-* `backend/dev/run_all_tests.py` is an automatic self-test (needs only numpy); you never need to run it.
+No system can be 100 % accurate on real human audio, and free hosting cannot serve thousands of simultaneous
+users with this model. Compute cost per reciter is roughly 1–2 CPU cores for as long as they speak; only
+running the model on each user's own phone makes cost independent of the number of users.
+`backend/dev/run_all_tests.py` and `mutation_test.py` are automatic self-tests (numpy only).

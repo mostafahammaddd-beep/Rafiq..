@@ -50,7 +50,7 @@ class RecitationSession(
         fun onConnection(state: Int)
         fun onReady(words: List<String>)
         fun onProgress(tracked: Int, committed: Int, audioMs: Long, updates: List<WordResult>)
-        fun onFinal(words: List<WordResult>, complete: Boolean)
+        fun onFinal(words: List<WordResult>, complete: Boolean, debug: String)
         fun onLevel(rms: Float, voiced: Boolean, audioMs: Long)
         fun onAutoStop()
         fun onError(message: String)
@@ -291,7 +291,8 @@ class RecitationSession(
                 val words = parseWords(o.optJSONArray("words"))
                 val summary = o.optJSONObject("summary")
                 val complete = summary?.optBoolean("complete", false) ?: false
-                main.post { listener.onFinal(words, complete) }
+                val debugText = o.optJSONObject("debug")?.toString() ?: ""
+                main.post { listener.onFinal(words, complete, debugText) }
                 try {
                     socket?.close(1000, "done")
                 } catch (_: Exception) {

@@ -44,7 +44,7 @@ from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 # Thread pools must be pinned BEFORE numpy / torch are imported.
-NUM_THREADS = 8
+NUM_THREADS = int(os.environ.get("RAFIQ_THREADS", "4"))   # Modal cores / local CPU threads
 os.environ.setdefault("OMP_NUM_THREADS", str(NUM_THREADS))
 os.environ.setdefault("MKL_NUM_THREADS", str(NUM_THREADS))
 os.environ.setdefault("OPENBLAS_NUM_THREADS", str(NUM_THREADS))
@@ -61,7 +61,8 @@ except ImportError:  # pragma: no cover
 # Deployment switches (the only things you may want to change)
 # ==============================================================================
 USE_GPU = False          # set True ONLY after you add a card to Modal (T4 GPU = ~10x faster)
-PRECISION = "auto"       # "auto": benchmark, use int8 only if fp32 is too slow | "fp32" | "int8"
+PRECISION = "auto"       # "auto": int8 only if fp32 is far too slow (rtf > AUTO_INT8_ABOVE_RTF) | "fp32" | "int8"
+AUTO_INT8_ABOVE_RTF = 0.60
 MODEL_ID = "obadx/muaalem-model-v3_2"
 APP_NAME = "rafiq-quran-muaalem-backend"
 DEFAULT_SURA, DEFAULT_AYA = 2, 255
@@ -96,7 +97,9 @@ SIFAT_LEVELS: Tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class Preset:
-    """Strictness profile. 'balanced' is the default and is tuned to avoid false alarms."""
+    """Strictness profile. 'balanced' is the default.
+    NOTE: CTC posteriors of emitted tokens are ~0.99-1.0 for almost everything (see live log), so the
+    confidence gates only remove genuinely uncertain emissions; the tolerance rules do the real work."""
     name: str
     conf_letter: float          # min model confidence to report a letter / tajweed issue
     conf_vowel: float           # min model confidence to report a vowel (tashkeel) issue
@@ -107,16 +110,23 @@ class Preset:
     flag_extra_vowel: bool
     flag_extra_letter: bool
     flag_extra_shaddah: bool
+    flag_waqf_no_pause: bool    # word-final vowel dropped although the reciter did not stop
     sifat_levels: Tuple[str, ...]
 
 
 PRESETS: Dict[str, Preset] = {
-    "relaxed": Preset("relaxed", 0.90, 0.90, 0.94, 2, 3, False, False, False, False,
-                      ("qalqla", "ghonna")),
-    "balanced": Preset("balanced", 0.80, 0.80, 0.90, 1, 1, True, True, False, False,
-                       ("qalqla", "ghonna", "tafkheem_or_taqeeq")),
-    "strict": Preset("strict", 0.65, 0.65, 0.80, 0, 0, True, True, True, True,
-                     ("qalqla", "ghonna", "tafkheem_or_taqeeq")),
+    "relaxed": Preset("relaxed", conf_letter=0.85, conf_vowel=0.85, conf_sifat=0.92,
+                      short_slack=1, long_slack=2, flag_missing_vowel=False, flag_extra_vowel=False,
+                      flag_extra_letter=False, flag_extra_shaddah=False, flag_waqf_no_pause=False,
+                      sifat_levels=("qalqla", "ghonna")),
+    "balanced": Preset("balanced", conf_letter=0.70, conf_vowel=0.70, conf_sifat=0.82,
+                       short_slack=0, long_slack=1, flag_missing_vowel=True, flag_extra_vowel=True,
+                       flag_extra_letter=False, flag_extra_shaddah=False, flag_waqf_no_pause=False,
+                       sifat_levels=("qalqla", "ghonna", "tafkheem_or_taqeeq")),
+    "strict": Preset("strict", conf_letter=0.50, conf_vowel=0.50, conf_sifat=0.65,
+                     short_slack=0, long_slack=0, flag_missing_vowel=True, flag_extra_vowel=True,
+                     flag_extra_letter=True, flag_extra_shaddah=True, flag_waqf_no_pause=True,
+                     sifat_levels=("qalqla", "ghonna", "tafkheem_or_taqeeq")),
 }
 
 
@@ -227,8 +237,15 @@ def hint(letter: str) -> str:
     return f" ({h})" if h else ""
 
 
+def _disp(c: str) -> str:
+    """How a phoneme is shown to the user (QPS madd marks are shown by name, never as raw symbols)."""
+    if c in ALWAYS_MADD:
+        return {"ا": "مدّ الألف", "ۥ": "مدّ الواو", "ۦ": "مدّ الياء"}[c]
+    return f"«{c}»"
+
+
 def note_replace(e: str, p: str) -> str:
-    return f"نطقتَ «{p}» بدل «{e}». الصواب أن تنطق «{e}»{hint(e)}."
+    return f"نطقتَ {_disp(p)} بدل {_disp(e)}. الصواب أن تنطق {_disp(e)}{hint(e)}."
 
 
 def note_missing_letter(e: str) -> str:
@@ -263,6 +280,21 @@ def note_vowel_extra(letter: str, p: str) -> str:
 
 def madd_name(c: str) -> str:
     return {"ا": "الألف", "و": "الواو", "ۥ": "الواو", "ي": "الياء", "ى": "الياء", "ۦ": "الياء"}.get(c, "حرف المد")
+
+
+MADD_VOWEL = {"ا": "الفتحة", "ۥ": "الضمة", "ۦ": "الكسرة"}
+
+
+def note_madd_vowel_swap(c: str, p: str) -> str:
+    return (f"حرف المدّ: المطلوب {_disp(c)} (من {MADD_VOWEL.get(c, '')}) ولكنك مددتَ {_disp(p)} "
+            f"(من {MADD_VOWEL.get(p, '')}). انتبه لحركة الحرف قبل المدّ.")
+
+
+def note_waqf_no_pause(vowel: str) -> str:
+    name = CORE_VOWELS.get(vowel, "حركة")
+    how = VOWEL_HOW.get(vowel, "")
+    return (f"آخر هذه الكلمة: المطلوب {name} (أو تنوين) لأنك تصل القراءة بما بعدها، "
+            f"لكنك سكّنتَ آخرها دون أن تقف. التسكين يكون عند الوقف فقط. {how}").strip()
 
 
 def note_madd_short(c: str, need_text: str) -> str:
@@ -502,6 +534,33 @@ def group_index_map(groups: Optional[List[Dict[str, Any]]], text: str) -> Option
     return m
 
 
+def tolerant_group_map(groups: Optional[List[Dict[str, Any]]], text: str) -> Optional[List[int]]:
+    """Like group_index_map, but survives small differences (e.g. a doubled vowel mark at a window
+    edge) by aligning the concatenated group text to the phoneme string."""
+    if not groups or not text:
+        return None
+    joined = "".join(g["g"] for g in groups)
+    if not joined:
+        return None
+    al = align(joined, text, tail_free_ref=False)
+    if al.cost > 0.15 * max(len(joined), len(text)):
+        return None
+    owner: List[int] = []
+    for gi, g in enumerate(groups):
+        owner.extend([gi] * len(g["g"]))
+    out = [-1] * len(text)
+    for ri, pj in al.pairs:
+        if ri >= 0 and pj >= 0:
+            out[pj] = owner[ri]
+    last = 0
+    for j in range(len(out)):                  # unmatched chars inherit the previous group
+        if out[j] < 0:
+            out[j] = last
+        else:
+            last = out[j]
+    return out
+
+
 # ==============================================================================
 # Reference (one ayah): words, wasl/waqf phoneme forms, expected sifat
 # ==============================================================================
@@ -542,8 +601,13 @@ def proportional_groups(words: List[str], phonemes: str) -> List[str]:
 class RefAya:
     def __init__(self, sura: int, aya: int, words: List[str], wasl: List[str],
                  waqf: List[Optional[str]], approx: bool, full_out: Any,
-                 exp_groups: Optional[List[Dict[str, Any]]], uthmani: str = ""):
+                 exp_groups: Optional[List[Dict[str, Any]]], uthmani: str = "",
+                 info: Optional[Dict[str, Any]] = None,
+                 word_exact: Optional[List[bool]] = None):
         self.sura, self.aya = sura, aya
+        self.info: Dict[str, Any] = info or {}
+        self.word_approx: List[bool] = [not e for e in (word_exact or [not approx] * len(words))]
+        approx = any(self.word_approx)
         self.words = words
         self.wasl = wasl
         self.waqf = waqf
@@ -570,44 +634,191 @@ class RefAya:
     def describe(self) -> Dict[str, Any]:
         return {
             "sura": self.sura, "aya": self.aya, "n_words": self.n, "approx_segmentation": self.approx,
-            "sifat_available": self.group_of_char is not None,
+            "sifat_available": self.group_of_char is not None, "info": self.info,
             "words": [{"i": k, "text": self.words[k], "wasl": self.wasl[k], "waqf": self.waqf[k]}
                       for k in range(self.n)],
         }
+
+
+def _lcp(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def refine_bounds(full_ph: str, bounds: List[int]) -> List[int]:
+    """A word cannot start with a vowel mark or a silah/madd letter: those stay with the previous word
+    (the live log showed the previous word's final vowel leaking into the next word's expected form)."""
+    out = list(bounds)
+    n = len(full_ph)
+    for k in range(1, len(out) - 1):
+        b = out[k]
+        while b < n - 1 and b < out[k + 1] - 1 and (is_mark(full_ph[b]) or full_ph[b] in "ۥۦ"):
+            b += 1
+        out[k] = b
+    return out
+
+
+def _segment_by_isolated_words(lib: Any, words: List[str], full_ph: str,
+                               info: Dict[str, Any]) -> Optional[List[int]]:
+    """
+    Word boundaries that do not rely on the library's spaced output: phonetize every word on its own,
+    align the concatenation against the full phoneme string, read the boundaries off the alignment.
+    """
+    iso: List[str] = []
+    for w in words:
+        try:
+            iso.append(clean_phonemes(lib.phonetize(w, True).phonemes))
+        except Exception as exc:
+            info["iso_error"] = repr(exc)[:160]
+            return None
+    if any(not s for s in iso):
+        info["iso_error"] = "empty isolated phonemes"
+        return None
+    S = "".join(iso)
+    cum = [0]
+    for s in iso:
+        cum.append(cum[-1] + len(s))
+    al = align(S, full_ph, tail_free_ref=False)
+    s2f = {ri: pj for ri, pj in al.pairs if ri >= 0 and pj >= 0}
+    info["iso_align_cost_per_char"] = round(al.cost / max(1, len(full_ph)), 4)
+    bounds = [0]
+    for k in range(1, len(words)):
+        j = None
+        for r in range(cum[k], len(S)):
+            if r in s2f:
+                j = s2f[r]
+                break
+        if j is None:
+            return None
+        bounds.append(j)
+    bounds.append(len(full_ph))
+    if any(bounds[i + 1] <= bounds[i] for i in range(len(bounds) - 1)):
+        info["iso_error"] = "non-monotonic boundaries"
+        return None
+    return refine_bounds(full_ph, bounds)
+
+
+def _snap_to_library_groups(bounds: List[int], group_starts: List[int],
+                            tol: int = 3) -> Tuple[List[int], List[bool]]:
+    """Replace estimated boundaries by the library's own (exact) group boundaries where one is close."""
+    out = list(bounds)
+    exact = [False] * len(bounds)
+    exact[0] = exact[-1] = True
+    used = set()
+    for k in range(1, len(bounds) - 1):
+        cands = [g for g in group_starts if abs(g - bounds[k]) <= tol and g not in used]
+        if cands:
+            g = min(cands, key=lambda x: abs(x - bounds[k]))
+            if out[k - 1] < g:
+                out[k], exact[k] = g, True
+                used.add(g)
+    for k in range(1, len(out)):                 # keep strictly increasing
+        if out[k] <= out[k - 1]:
+            out[k], exact[k] = out[k - 1] + 1, False
+    return out, exact
 
 
 def build_ref_aya(sura: int, aya: int, lib: Any, with_waqf: bool = True) -> RefAya:
     """
     `lib` must provide:  get_uthmani(sura, aya) -> str
                          phonetize(text, remove_spaces) -> object with .phonemes (str) [and .sifat]
+
+    Word segmentation ladder (first that validates wins; the winner is recorded in `info`):
+      spaced-exact    the library's own spaced output matches the no-space output exactly
+      spaced-adopted  same number of words, <= 2 % different: use the spaced words as the reference
+      aligned         isolated-word phonetization aligned to the full string (about +-1 char at edges)
+      proportional    last resort (flagged approximate)
     """
     uth = lib.get_uthmani(sura, aya)
     raw, words, tok_idx = split_words(uth)
     n = len(words)
     full = lib.phonetize(uth, True)
-    full_ph = clean_phonemes(full.phonemes)
-    groups: Optional[List[str]] = None
-    try:
-        g = split_groups(lib.phonetize(uth, False).phonemes)
-        if len(g) == n and "".join(g) == full_ph:
-            groups = g
-    except Exception:
-        groups = None
-    approx = groups is None
-    if approx:
-        groups = proportional_groups(words, full_ph)
+    F = clean_phonemes(full.phonemes)
+    info: Dict[str, Any] = {"n_words": n, "full_len": len(F), "full_head": F[:90]}
 
+    groups: Optional[List[str]] = None
+    strategy = ""
+    word_exact: Optional[List[bool]] = None
+    lib_groups: Optional[List[str]] = None
+    try:
+        spaced_raw = str(lib.phonetize(uth, False).phonemes)
+        g = split_groups(spaced_raw)
+        joined = "".join(g)
+        info.update({"spaced_head": spaced_raw[:90], "n_groups": len(g), "join_equal": joined == F})
+        if joined != F:
+            info["first_diff_at"] = _lcp(joined, F)
+        else:
+            lib_groups = g
+        if len(g) == n:
+            if joined == F:
+                groups, strategy = g, "spaced-exact"
+            else:
+                diff = align(joined, F, tail_free_ref=False).cost / max(1, len(F))
+                info["spaced_diff"] = round(diff, 4)
+                if diff <= 0.02:
+                    groups, strategy = g, "spaced-adopted"
+    except Exception as exc:
+        info["spaced_error"] = repr(exc)[:200]
+    if groups is None:
+        bounds = _segment_by_isolated_words(lib, words, F, info)
+        if bounds is not None:
+            strategy = "aligned"
+            exact = [False] * len(bounds)
+            exact[0] = exact[-1] = True
+            if lib_groups:                      # merged words in the library output: snap to its exact edges
+                gs, acc = [], 0
+                for gr in lib_groups[:-1]:
+                    acc += len(gr)
+                    gs.append(acc)
+                bounds, exact = _snap_to_library_groups(bounds, gs)
+                info["snapped_boundaries"] = sum(1 for e in exact[1:-1] if e)
+                if info["snapped_boundaries"]:
+                    strategy = "spaced+aligned"
+            groups = [F[bounds[i]:bounds[i + 1]] for i in range(n)]
+            word_exact = [exact[i] and exact[i + 1] for i in range(n)]
+    if groups is None:
+        groups, strategy = proportional_groups(words, F), "proportional"
+    info["segmentation"] = strategy
+    if word_exact is None:
+        word_exact = [strategy in ("spaced-exact", "spaced-adopted")] * n
+    approx = not all(word_exact)
+    info["inexact_words"] = sum(1 for e in word_exact if not e)
+
+    # ---- waqf (stop) form of every word: tail of the phonemes of "text up to this word"
     waqf: List[Optional[str]] = [None] * n
-    if with_waqf and not approx:
+    if with_waqf and strategy != "proportional":
+        starts = [0]
+        for gr in groups:
+            starts.append(starts[-1] + len(gr))
+        ok_cnt = 0
         for k in range(n - 1):
             try:
-                g = split_groups(lib.phonetize(" ".join(raw[: tok_idx[k] + 1]), False).phonemes)
-                if len(g) == k + 1:
-                    waqf[k] = g[-1]
+                P = clean_phonemes(lib.phonetize(" ".join(raw[: tok_idx[k] + 1]), True).phonemes)
             except Exception:
-                waqf[k] = None
-    exp_groups = convert_sifat(getattr(full, "sifat", None))
-    return RefAya(sura, aya, words, groups, waqf, approx, full, exp_groups, uth)
+                continue
+            start = starts[k]
+            if _lcp(P, F) < start - 1:
+                continue
+            tail = P[start:]
+            if 1 <= len(tail) <= len(groups[k]) + 6 and tail != groups[k]:
+                waqf[k] = tail
+                ok_cnt += 1
+        info["waqf_forms"] = ok_cnt
+
+    raw_sifat = getattr(full, "sifat", None)
+    exp_groups = convert_sifat(raw_sifat)
+    try:
+        info["exp_sifat_n"] = len(raw_sifat) if raw_sifat else 0
+        if raw_sifat:
+            info["exp_sifat_sample"] = repr(raw_sifat[0])[:300]
+    except Exception:
+        pass
+    ref = RefAya(sura, aya, words, groups, waqf, approx, full, exp_groups, uth, info, word_exact)
+    info["sifat_tiles_reference"] = ref.group_of_char is not None
+    return ref
 
 
 # ==============================================================================
@@ -668,20 +879,24 @@ def _need_text(lo: int, e: int) -> str:
 
 
 def madd_bounds(exp: str, s: int, e: int) -> Tuple[int, int]:
-    """Accepted number of harakat (lo, hi) for the madd run exp[s:e] — generous, rule-aware."""
+    """
+    Accepted number of harakat (lo, hi) for the madd run exp[s:e].  The live model counts agree with the
+    moshaf almost exactly (natural = 2, muttasil/munfasil = 4), so the base range is tight and the
+    preset slacks (short_slack / long_slack) decide how much extra is tolerated.
+    """
     E = e - s
-    after_letters = [ch for ch in exp[e:] if not is_mark(ch)]
-    final_zone = len(after_letters) <= 1
-    muttasil = bool(after_letters) and after_letters[0] == "ء"
+    after = [ch for ch in exp[e:] if not is_mark(ch)]
+    n_after = len(after)
+    muttasil = bool(after) and after[0] == "ء"
     if E >= 6:
-        return 4, 8
+        return 5, 7                              # lazim
     if muttasil and E >= 3:
-        return 4, 6
-    if final_zone:
-        return 2, max(E, 6)
-    if E >= 3:
-        return 2, 6
-    return 2, 4
+        return 4, 6                              # muttasil
+    if n_after == 0:
+        return (3, 7) if E >= 3 else (2, 2)      # munfasil / silah kubra  |  natural, silah sughra
+    if n_after == 1:
+        return (3, 7) if E >= 3 else (2, 6)      # ... | possible 'aarid madd at a stop (2/4/6)
+    return (3, 6) if E >= 3 else (2, 2)          # natural madd inside the word
 
 
 def judge_word(
@@ -692,19 +907,22 @@ def judge_word(
     lead: int = 0,
     trail: int = 0,
     approx: bool = False,
-) -> Tuple[List[Issue], Optional[Alignment], str]:
+    ctx_chars: str = "",
+) -> Tuple[List[Issue], Optional[Alignment], str, Dict[str, float]]:
     """
     Compares ONE spoken word (`seg` = its predicted phonemes, with up to `lead`/`trail` chars of
     unassigned neighbours) against its expected form(s). Returns (issues, alignment, chosen_form).
     Only errors that survive the tolerance rules and the confidence gate are returned.
     """
     best: Optional[Tuple[str, Alignment]] = None
+    form_costs: Dict[str, float] = {}
     for f in dict.fromkeys(x for x in forms if x):
         al = align(f, seg, tail_free_ref=False, pred_lead_free=lead, tail_ins_chars=trail)
+        form_costs[f] = al.cost
         if best is None or al.cost < best[1].cost - 1e-9:
             best = (f, al)
     if best is None:
-        return [], None, ""
+        return [], None, "", form_costs
     exp, al = best
     M, L = len(exp), len(seg)
     r2p = {ri: pj for ri, pj in al.pairs if ri >= 0 and pj >= 0}
@@ -768,8 +986,13 @@ def judge_word(
                 pj = subs[0]
                 pc = seg[pj]
                 conf = _conf(probs, [pj])
-                if c in BASIC_LETTERS and pc in BASIC_LETTERS:
-                    issues.append(Issue("letters", "replace", note_replace(c, pc), conf, s, c, pc, c))
+                if c in ALWAYS_MADD and pc in ALWAYS_MADD and c != pc:
+                    # a different madd letter (fatha-madd / damma-madd / kasra-madd) = the vowel changed
+                    issues.append(Issue("tashkeel", "madd_vowel_swap", note_madd_vowel_swap(c, pc),
+                                        conf, s, c, pc, ""))
+                elif (c in BASIC_LETTERS or c in ALWAYS_MADD) and (pc in BASIC_LETTERS or pc in ALWAYS_MADD):
+                    issues.append(Issue("letters", "replace", note_replace(c, pc), conf, s, c, pc,
+                                        c if c in BASIC_LETTERS else ""))
                 else:
                     issues.append(Issue("tajweed", "rule", NOTE_RULE, conf, s, c, pc, ""))
                 continue
@@ -803,10 +1026,16 @@ def judge_word(
                 issues.append(Issue("tajweed", "madd_long", note_madd_long(c, min(E, hi)),
                                     conf, s, c * E, c * p, c))
         elif c in BASIC_LETTERS:
-            if E >= 2 and p == 1:
+            if preset.name == "strict":
+                min_ok = E
+            elif preset.name == "balanced":
+                min_ok = 2 if E == 2 else E - 1
+            else:
+                min_ok = 1
+            if E >= 2 and p < min_ok:
                 issues.append(Issue("tajweed", "shaddah_dropped", note_shaddah_dropped(c),
                                     conf, s, c * E, c * p, c))
-            elif E == 1 and p >= 2 and preset.flag_extra_shaddah:
+            elif E >= 1 and p > E and preset.flag_extra_shaddah:
                 issues.append(Issue("tajweed", "shaddah_extra", note_shaddah_extra(c),
                                     conf, s, c, c * p, c))
 
@@ -829,20 +1058,26 @@ def judge_word(
 
     # ---------------------------------------------------------------- confidence gate
     kept: List[Issue] = []
+    edge_kinds = ("missing", "replace", "extra", "rule", "vowel_missing")
     for it in issues:
         need = preset.conf_vowel if it.t == "tashkeel" else preset.conf_letter
         if it.conf < need:
             continue
-        if approx and (it.pos < 2 or it.pos >= M - 2):
-            continue                      # segmentation is approximate: ignore word edges
+        if approx and it.k in edge_kinds and (it.pos < 1 or it.pos >= M - 1) and ctx_chars:
+            # boundaries are only +-1 char accurate: an edge issue is ambiguous only when the letter
+            # involved also sits at the neighbouring word's adjacent edge (it may belong to that word)
+            if it.exp[:1] in ctx_chars or it.pred[:1] in ctx_chars:
+                continue
         kept.append(it)
+    if any(i.k == "vowel_swap" for i in kept):          # same mistake seen twice (vowel + its madd letter)
+        kept = [i for i in kept if i.k != "madd_vowel_swap"]
     kept.sort(key=lambda i: (i.pos, -SEVERITY[i.t]))
 
     letter_issues = [i for i in kept if i.t == "letters"]
     if len(letter_issues) >= UNCLEAR_ISSUES:
         kept = [Issue("letters", "unclear", NOTE_UNCLEAR,
                       min(i.conf for i in letter_issues), 0, exp, seg, "")]
-    return kept[:3], al, exp
+    return kept[:3], al, exp, form_costs
 
 
 # ==============================================================================
@@ -954,7 +1189,7 @@ class SessionEngine:
         self.skip_mode = False
         self.debug: Dict[str, Any] = {
             "created": time.time(), "sura": ref.sura, "aya": ref.aya, "preset": preset.name,
-            "approx_segmentation": ref.approx, "meta": meta or {}, "steps": [],
+            "approx_segmentation": ref.approx, "ref_info": ref.info, "meta": meta or {}, "steps": [],
         }
 
     # ------------------------------------------------------------------ audio in
@@ -1052,12 +1287,16 @@ class SessionEngine:
         pred = clean_phonemes(rec.text)
         probs = rec.probs if (rec.probs is not None and pred == rec.text
                               and len(rec.probs) == len(pred)) else None
-        pred_gmap = group_index_map(rec.sifat, pred) if rec.sifat else None
+        pred_gmap = (group_index_map(rec.sifat, pred) or tolerant_group_map(rec.sifat, pred)) if rec.sifat else None
         step_dbg: Dict[str, Any] = {
             "seq": self.seq + 1, "win_s": [round(wf0 * FRAME / SR, 2), round(n / SR, 2)],
             "wave_s": round(wave.size / SR, 2), "inf_s": round(inf_s, 2), "forced": forced,
             "flush": flush, "pause_end": pause_end, "pred": pred, "cursor_in": self.cursor,
         }
+        step_dbg["sifat"] = {"pred_groups": len(rec.sifat) if rec.sifat else 0,
+                             "pred_mapped": pred_gmap is not None,
+                             "ref_tiles": self.ref.group_of_char is not None,
+                             "probs": probs is not None}
         self.seq += 1
         updates: List[Dict[str, Any]] = []
         tracked_before = self.tracked
@@ -1170,12 +1409,14 @@ class SessionEngine:
             elif w not in pj_of_word or cov(w) < WORD_SKIP_COV:
                 self.results[w] = ("letters", [Issue("letters", "skipped", NOTE_SKIPPED, 1.0)])
             else:
-                issues = self._judge(w, pj_of_word, words_with_pj, pred, probs, rec, pred_gmap,
-                                     al, base, ref_str)
+                issues, jinfo = self._judge(w, pj_of_word, words_with_pj, pred, probs, rec, pred_gmap,
+                                            al, base, ref_str, vsel)
                 self.results[w] = (status_of(issues), issues)
             st, iss = self.results[w]
             updates.append(self._update_item(w))
-            judged_dbg.append({"w": w, "s": st, "issues": [i.to_debug() for i in iss]})
+            entry = {"w": w, "s": st, "issues": [i.to_debug() for i in iss]}
+            entry.update(locals().get("jinfo", {}) if st != "unchecked" else {})
+            judged_dbg.append(entry)
         dbg["judged"] = judged_dbg
         self.cursor = end_elig
         if self.cursor >= N:
@@ -1186,7 +1427,8 @@ class SessionEngine:
 
     def _judge(self, w: int, pj_of_word: Dict[int, List[int]], words_with_pj: List[int], pred: str,
                probs: Optional[List[float]], rec: Recognition, pred_gmap: Optional[List[int]],
-               al: Alignment, base: int, ref_str: str) -> List[Issue]:
+               al: Alignment, base: int, ref_str: str,
+               vsel: np.ndarray) -> Tuple[List[Issue], Dict[str, Any]]:
         ref, L = self.ref, len(pred)
         pjs = pj_of_word[w]
         first, last = min(pjs), max(pjs) + 1
@@ -1198,18 +1440,69 @@ class SessionEngine:
         hi = max(hi, last)
         seg = pred[lo:hi]
         seg_probs = probs[lo:hi] if probs is not None else None
-        issues, wal, _form = judge_word(
+        approx_w = ref.word_approx[w]
+        ctx = ""
+        if approx_w:
+            if w > 0:
+                ctx += ref.wasl[w - 1][-2:]
+            if w + 1 < ref.n:
+                ctx += ref.wasl[w + 1][:2]
+        issues, _wal, form, costs = judge_word(
             ref.forms(w), seg, seg_probs, self.preset,
-            lead=first - lo, trail=hi - last, approx=ref.approx)
+            lead=first - lo, trail=hi - last, approx=approx_w, ctx_chars=ctx)
+        extra = self._waqf_without_pause(w, form, costs, pj_of_word, L, vsel)
+        if extra is not None:
+            issues = issues + [extra]
+        trace: List[Any] = []
         if self.preset.sifat_levels and ref.group_of_char is not None and pred_gmap is not None and rec.sifat:
-            issues = (issues + self._sifat_issues(w, al, base, ref_str, pred, pred_gmap, rec.sifat))[:3]
-        return issues
+            s_issues, trace = self._sifat_issues(w, al, base, ref_str, pred, pred_gmap, rec.sifat)
+            issues = issues + s_issues
+        info = {"seg": seg, "exp": form, "form": "waqf" if (form != ref.wasl[w]) else "wasl",
+                "sifat_cmp": trace[:14], "exact": not approx_w}
+        return issues[:3], info
+
+    def _waqf_without_pause(self, w: int, form: str, costs: Dict[str, float],
+                            pj_of_word: Dict[int, List[int]], L: int,
+                            vsel: np.ndarray) -> Optional[Issue]:
+        """Word-final vowel dropped (stop form) although the reciter kept going: tashkeel mistake.
+        A real stop shows up as a silence in the audio next to the word boundary; no silence = no stop."""
+        ref = self.ref
+        waqf = ref.waqf[w]
+        if (not self.preset.flag_waqf_no_pause or not waqf or waqf == ref.wasl[w] or form != waqf
+                or w + 1 >= ref.n or (w + 1) not in pj_of_word or len(vsel) < 6):
+            return None
+        if costs.get(ref.wasl[w], 99.0) - costs.get(waqf, 99.0) < 0.3:
+            return None                    # the stop form is not clearly better than the continuation
+        t_end = self._pred_to_sample(max(pj_of_word[w]), L, vsel)
+        t_next = self._pred_to_sample(min(pj_of_word[w + 1]), L, vsel)
+        if t_end is None or t_next is None:
+            return None
+        lo_f = max(min(t_end, t_next) // FRAME - 25, int(vsel[0]))      # +-0.5 s around the boundary
+        hi_f = min(max(t_end, t_next) // FRAME + 25, int(vsel[-1]))
+        if hi_f - lo_f < 10:
+            return None
+        vset = set(int(x) for x in vsel)
+        run = best = 0
+        for f in range(lo_f, hi_f + 1):
+            if f in vset:
+                run = 0
+            else:
+                run += 1
+                best = max(best, run)
+        if best >= 5:                      # >= 100 ms of silence: a real pause, the stop form is fine
+            return None
+        vowel = next((ch for ch in reversed(ref.wasl[w]) if ch in CORE_VOWELS), "")
+        return Issue("tashkeel", "waqf_no_pause", note_waqf_no_pause(vowel), 0.9, 0, waqf, ref.wasl[w], "")
 
     def _sifat_issues(self, w: int, al: Alignment, base: int, ref_str: str, pred: str,
-                      pred_gmap: List[int], pred_sifat: List[Dict[str, Any]]) -> List[Issue]:
+                      pred_gmap: List[int], pred_sifat: List[Dict[str, Any]]) -> Tuple[List[Issue], List[Any]]:
+        """Compares the model's per-letter properties with the expected ones. Returns (issues, trace)
+        where trace lists [letter, level, expected, predicted, prob, flagged] for the report."""
         ref = self.ref
         out: List[Issue] = []
+        trace: List[Any] = []
         seen = set()
+        pos = lambda s, key: key in s and "not_" not in s and "no_" not in s
         for ri, pj in al.pairs:
             if ri < 0 or pj < 0 or ref.word_of_char[base + ri] != w:
                 continue
@@ -1227,25 +1520,34 @@ class SessionEngine:
             for lv in self.preset.sifat_levels:
                 elab, _ = eg["L"].get(lv, (None, None))
                 plab, pprob = pg["L"].get(lv, (None, None))
-                if elab is None or plab is None or elab == plab:
+                if elab is None or plab is None:
                     continue
+                if "PAD" in elab or "PAD" in plab:
+                    continue                     # the model abstains for letters where this property is undefined
                 conf = pprob if pprob is not None else 0.92
-                if conf < self.preset.conf_sifat:
-                    continue
-                e_pos = lambda s, key: key in s and "not_" not in s and "no_" not in s
-                if lv == "qalqla" and e_pos(elab, "moqalqal") and not e_pos(plab, "moqalqal"):
-                    out.append(Issue("tajweed", "qalqla", note_qalqla(el), conf, 0, elab, plab, el))
-                elif lv == "ghonna":
-                    eg_yes, pg_yes = e_pos(elab, "maghnoon"), e_pos(plab, "maghnoon")
-                    if eg_yes != pg_yes:
-                        out.append(Issue("tajweed", "ghonna", note_ghonna(el, eg_yes), conf, 0, elab, plab, el))
-                elif lv == "tafkheem_or_taqeeq":
-                    e_h = "mofakham" in elab and "low" not in elab
-                    p_h = "mofakham" in plab and "low" not in plab
-                    e_l, p_l = "moraqaq" in elab, "moraqaq" in plab
-                    if (e_h and p_l) or (e_l and p_h):
-                        out.append(Issue("tajweed", "tafkheem", note_tafkheem(el, e_h), conf, 0, elab, plab, el))
-        return out
+                flagged = False
+                if elab != plab and conf >= self.preset.conf_sifat:
+                    if lv == "qalqla" and pos(elab, "moqalqal") and not pos(plab, "moqalqal"):
+                        out.append(Issue("tajweed", "qalqla", note_qalqla(el), conf, 0, elab, plab, el))
+                        flagged = True
+                    elif lv == "ghonna":
+                        e_yes, p_yes = pos(elab, "maghnoon"), pos(plab, "maghnoon")
+                        if e_yes != p_yes:
+                            out.append(Issue("tajweed", "ghonna", note_ghonna(el, e_yes), conf, 0, elab, plab, el))
+                            flagged = True
+                    elif lv == "tafkheem_or_taqeeq":
+                        e_h = "mofakham" in elab and "low" not in elab
+                        p_h = "mofakham" in plab and "low" not in plab
+                        e_l, p_l = "moraqaq" in elab, "moraqaq" in plab
+                        if (e_h and p_l) or (e_l and p_h):
+                            out.append(Issue("tajweed", "tafkheem", note_tafkheem(el, e_h), conf, 0, elab, plab, el))
+                            flagged = True
+                interesting = (lv == "tafkheem_or_taqeeq" and elab != plab) or \
+                              (lv != "tafkheem_or_taqeeq" and (pos(elab, "moqalqal") or pos(plab, "moqalqal")
+                                                                 or pos(elab, "maghnoon") or pos(plab, "maghnoon")))
+                if interesting:
+                    trace.append([el, lv, elab, plab, round(conf, 3), flagged])
+        return out, trace
 
     # ------------------------------------------------------------------ window management
     def _pred_to_sample(self, pj: int, L: int, vsel: np.ndarray) -> Optional[int]:
@@ -1413,6 +1715,7 @@ class ModelRuntime:
         self.bench_rtf_int8: Optional[float] = None
         self.load_seconds: Optional[float] = None
         self.load_error: Optional[str] = None
+        self.diag: Dict[str, Any] = {}
         self._refs: Dict[Tuple[int, int], RefAya] = {}
         self._load_lock = threading.Lock()
         self._ref_lock = threading.Lock()
@@ -1474,7 +1777,7 @@ class ModelRuntime:
         if it really is faster and still runs). Any failure leaves the original fp32 model."""
         rtf = self._time_inference(m, ref)
         self.bench_rtf = None if rtf is None else round(rtf, 3)
-        want_int8 = PRECISION == "int8" or (PRECISION == "auto" and rtf is not None and rtf > 0.22)
+        want_int8 = PRECISION == "int8" or (PRECISION == "auto" and rtf is not None and rtf > AUTO_INT8_ABOVE_RTF)
         if not want_int8 or getattr(m, "model", None) is None:
             return
         import torch
@@ -1532,20 +1835,42 @@ class ModelRuntime:
                 probs = arr.tolist() if arr.size == len(text) else None
             except Exception:
                 probs = None
-        return Recognition(text, probs, convert_sifat(getattr(out, "sifat", None)))
+        raw_sifat = getattr(out, "sifat", None)
+        sifat = convert_sifat(raw_sifat)
+        if "pred_sifat_n" not in self.diag or (raw_sifat and "pred_sifat_sample" not in self.diag):
+            try:                                   # shape of the library objects, for the debug report
+                self.diag["pred_sifat_n"] = len(raw_sifat) if raw_sifat else 0
+                if raw_sifat:
+                    self.diag["pred_sifat_sample"] = repr(raw_sifat[0])[:300]
+                self.diag["pred_sifat_converted"] = bool(sifat)
+                self.diag["phoneme_probs"] = probs is not None
+                self.diag["out_fields"] = [a for a in dir(out) if not a.startswith("_")][:20]
+            except Exception:
+                pass
+        return Recognition(text, probs, sifat)
 
     def status(self) -> Dict[str, Any]:
         return {
             "status": "ok" if self.muaalem is not None else ("error" if self.load_error else "loading"),
-            "engine": "rafiq-v14", "model": MODEL_ID, "device": self.device, "int8": self.int8,
+            "engine": "rafiq-v14.2", "model": MODEL_ID, "device": self.device, "int8": self.int8,
             "bench_rtf_fp32": self.bench_rtf, "bench_rtf_int8": self.bench_rtf_int8,
-            "load_seconds": self.load_seconds, "load_error": self.load_error,
+            "load_seconds": self.load_seconds, "load_error": self.load_error, "diag": self.diag,
             "refs": [{"sura": k[0], "aya": k[1], "words": v.n, "approx": v.approx,
+                      "segmentation": v.info.get("segmentation"), "waqf_forms": v.info.get("waqf_forms"),
                       "sifat": v.group_of_char is not None} for k, v in self._refs.items()],
         }
 
 
 RUNTIME = ModelRuntime()
+
+
+def debug_snapshot(eng: "SessionEngine", runtime: ModelRuntime, steps: int = 40) -> Dict[str, Any]:
+    """Compact trace of a session, sent with the final message (the server may scale to zero right
+    after a session, so the app keeps its own copy for the 'technical report' button)."""
+    d = dict(eng.debug)
+    d["steps"] = list(d.get("steps", []))[-steps:]
+    d["server"] = runtime.status()
+    return d
 
 
 # ==============================================================================
@@ -1638,7 +1963,7 @@ def build_fastapi_app(runtime: ModelRuntime = RUNTIME):
                         break
                 eng = state["engine"]
                 final = await asyncio.to_thread(eng.flush)
-                final["debug_session"] = len(SESSIONS)
+                final["debug"] = debug_snapshot(eng, runtime)
                 await send(final)
             except Exception as exc:
                 try:
@@ -1738,7 +2063,7 @@ if modal is not None:
     )
 
     _fn_kwargs: Dict[str, Any] = dict(
-        image=muaalem_image, cpu=float(NUM_THREADS), memory=8192, scaledown_window=300, timeout=900,
+        image=muaalem_image, cpu=float(NUM_THREADS), memory=4096, scaledown_window=10, timeout=900,
     )
     if USE_GPU:
         _fn_kwargs["gpu"] = "T4"

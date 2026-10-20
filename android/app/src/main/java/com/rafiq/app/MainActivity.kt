@@ -42,7 +42,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val c = RafiqController(applicationContext)
         controller = c
-        c.warmUp()
+        if (RecitationConfig.isMetered(applicationContext)) c.markSleeping() else c.warmUp()
         setContent {
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
                 RafiqApp(c)
@@ -112,7 +112,12 @@ fun RafiqApp(c: RafiqController) {
     if (sel != null) {
         val r = c.results.getOrNull(sel)
         if (r != null) {
-            WordDialog(word = c.words.getOrElse(sel) { "" }, r = r, onDismiss = { selected = null })
+            WordDialog(
+                word = c.words.getOrElse(sel) { "" },
+                r = r,
+                onDismiss = { selected = null },
+                onReport = { kind -> c.reportWord(sel, kind) }
+            )
         }
     }
     if (showSettings) {
@@ -132,6 +137,10 @@ fun TopBar(c: RafiqController, onSettings: () -> Unit) {
         2 -> {
             statusText = "⚠ لا اتصال بالخادم (اضغط)"
             chipColor = RedLetters
+        }
+        3 -> {
+            statusText = "⏸ الخادم نائم — اضغط لإيقاظه"
+            chipColor = Cream
         }
         else -> {
             statusText = "⏳ تجهيز الخادم…"
@@ -159,7 +168,7 @@ fun TopBar(c: RafiqController, onSettings: () -> Unit) {
             fontSize = 12.sp,
             modifier = Modifier
                 .clip(RoundedCornerShape(50))
-                .clickable(enabled = c.serverState == 2) { c.retryServer() }
+                .clickable(enabled = c.serverState == 2 || c.serverState == 3) { c.retryServer() }
                 .padding(horizontal = 8.dp, vertical = 4.dp)
         )
         Spacer(Modifier.width(4.dp))
@@ -447,7 +456,7 @@ fun CountChip(color: Color, label: String, n: Int) {
 }
 
 @Composable
-fun WordDialog(word: String, r: WordResult, onDismiss: () -> Unit) {
+fun WordDialog(word: String, r: WordResult, onDismiss: () -> Unit, onReport: (String) -> Unit) {
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = CardC,
@@ -492,6 +501,23 @@ fun WordDialog(word: String, r: WordResult, onDismiss: () -> Unit) {
         confirmButton = {
             TextButton(onClick = onDismiss) {
                 Text("حسنًا", color = Gold, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            if (r.status == "ok") {
+                TextButton(onClick = {
+                    onReport("missed")
+                    onDismiss()
+                }) {
+                    Text("⚠ فيها خطأ لم يُكتشف", color = Cream, fontSize = 12.sp)
+                }
+            } else if (r.status != "unchecked") {
+                TextButton(onClick = {
+                    onReport("wrong_flag")
+                    onDismiss()
+                }) {
+                    Text("✔ نطقتها صحيحة", color = Cream, fontSize = 12.sp)
+                }
             }
         }
     )
