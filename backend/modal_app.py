@@ -60,6 +60,7 @@ except ImportError:  # pragma: no cover
 # ==============================================================================
 # Deployment switches (the only things you may want to change)
 # ==============================================================================
+USE_MEMORY_SNAPSHOT = True   # fast cold starts (Modal restores a snapshot of the loaded model); False = old behaviour
 USE_GPU = False          # set True ONLY after you add a card to Modal (T4 GPU = ~10x faster)
 PRECISION = "auto"       # "auto": int8 only if fp32 is far too slow (rtf > AUTO_INT8_ABOVE_RTF) | "fp32" | "int8"
 AUTO_INT8_ABOVE_RTF = 0.60
@@ -75,7 +76,7 @@ FRAME = 320                       # 20 ms analysis frame
 MIN_NEW_AUDIO_S = 0.45            # run the model when at least this much new audio arrived
 MIN_VOICED_S = 0.35               # ...and the window contains at least this much speech
 MAX_WINDOW_S = 10.0               # hard cap on audio sent to the model per update
-MAX_BACKLOG_S = 45.0              # only if the server falls this far behind is old audio skipped
+MAX_BACKLOG_S = 240.0             # backlog (cold-start replay, bad network) is judged in order; skipped only beyond this
 TAIL_SILENCE_S = 0.35             # silence at the end of the audio = the reciter paused (waqf)
 CTX_WORDS = 2                     # already-judged words kept in the reference as free context
 CTX_MARGIN_S = 0.20               # the next window starts this much before its context word
@@ -177,6 +178,10 @@ MAKHRAJ: Dict[str, str] = {
     "ب": "يخرج من انطباق الشفتين", "م": "يخرج من انطباق الشفتين مع غنة",
     "و": "يخرج من استدارة الشفتين",
 }
+
+
+GHUNNA_LETTERS = set("نمويى")          # only these can carry ghunna (noon, meem, idgham bi-ghunna)
+TAFKHEEM_LETTERS = set("رلصضطظقغخ")      # letters whose heaviness is a real tajweed question
 
 
 def is_mark(c: str) -> bool:
@@ -924,6 +929,15 @@ def judge_word(
     if best is None:
         return [], None, "", form_costs
     exp, al = best
+    uniq = [f for f in dict.fromkeys(x for x in forms if x)]
+    if len(uniq) > 1 and exp != uniq[0]:
+        # a stop form won on cost, but if the reciter kept a final vowel he was NOT stopping:
+        # judge against the continuation form so the vowel mistake is reported properly
+        core_end = len(seg) - trail
+        letter_idx = [i for i in range(lead, core_end) if not is_mark(seg[i]) and seg[i] not in ALWAYS_MADD]
+        if letter_idx and any(seg[i] in CORE_VOWELS for i in range(letter_idx[-1] + 1, core_end)):
+            exp = uniq[0]
+            al = align(exp, seg, tail_free_ref=False, pred_lead_free=lead, tail_ins_chars=trail)
     M, L = len(exp), len(seg)
     r2p = {ri: pj for ri, pj in al.pairs if ri >= 0 and pj >= 0}
     aligned_p = set(r2p.values())
@@ -1187,6 +1201,7 @@ class SessionEngine:
         self.complete = False
         self.last_window: Tuple[int, int] = (0, 0)
         self.skip_mode = False
+        self._flush_iters = 0
         self.debug: Dict[str, Any] = {
             "created": time.time(), "sura": ref.sura, "aya": ref.aya, "preset": preset.name,
             "approx_segmentation": ref.approx, "ref_info": ref.info, "meta": meta or {}, "steps": [],
@@ -1524,8 +1539,15 @@ class SessionEngine:
                     continue
                 if "PAD" in elab or "PAD" in plab:
                     continue                     # the model abstains for letters where this property is undefined
+                if lv == "ghonna" and el not in GHUNNA_LETTERS:
+                    continue                     # ghunna on ل/ت/... is impossible: it is a label misalignment
+                if lv == "tafkheem_or_taqeeq" and el not in TAFKHEEM_LETTERS:
+                    continue
                 conf = pprob if pprob is not None else 0.92
                 flagged = False
+                if elab != plab and self._label_shift(lv, g, h, elab, plab, pred_sifat):
+                    trace.append([el, lv + "/shift-ignored", elab, plab, round(conf, 3), False])
+                    continue
                 if elab != plab and conf >= self.preset.conf_sifat:
                     if lv == "qalqla" and pos(elab, "moqalqal") and not pos(plab, "moqalqal"):
                         out.append(Issue("tajweed", "qalqla", note_qalqla(el), conf, 0, elab, plab, el))
@@ -1548,6 +1570,20 @@ class SessionEngine:
                 if interesting:
                     trace.append([el, lv, elab, plab, round(conf, 3), flagged])
         return out, trace
+
+    def _label_shift(self, lv: str, g: int, h: int, elab: str, plab: str,
+                     pred_sifat: List[Dict[str, Any]]) -> bool:
+        """The live report showed neighbouring letters with SWAPPED labels (م loses its ghunna while the
+        next ل gains one): that is the model's label sequence sliding by one group, not a mistake."""
+        groups = self.ref.exp_groups
+        for dg in (-1, 1):
+            g2, h2 = g + dg, h + dg
+            if 0 <= g2 < len(groups) and 0 <= h2 < len(pred_sifat):
+                e2 = groups[g2]["L"].get(lv, (None, None))[0]
+                p2 = pred_sifat[h2]["L"].get(lv, (None, None))[0]
+                if e2 is not None and p2 is not None and e2 == plab and p2 == elab and e2 != elab:
+                    return True
+        return False
 
     # ------------------------------------------------------------------ window management
     def _pred_to_sample(self, pj: int, L: int, vsel: np.ndarray) -> Optional[int]:
@@ -1612,15 +1648,21 @@ class SessionEngine:
         return {"type": "final", "audio_ms": self.audio_ms, "tracked": self.tracked,
                 "committed": self.cursor, "words": words, "summary": summary}
 
+    def flush_step(self) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """One more window while finishing (the reciter pressed stop). Returns (progress message, done)."""
+        before = (self.cursor, self.tracked, self.win_start, self.last_run_end)
+        msg = self.step(flush=True)
+        after = (self.cursor, self.tracked, self.win_start, self.last_run_end)
+        self._flush_iters += 1
+        done = (self.complete or self._flush_iters >= 80
+                or (after == before and self.last_run_end >= self.buf.n - FRAME))
+        return msg, done
+
     def flush(self) -> Dict[str, Any]:
-        """Judge everything that was heard (reciter pressed stop), then build the final report."""
-        for _ in range(16):
-            before = (self.cursor, self.tracked, self.win_start, self.last_run_end)
-            self.step(flush=True)
-            if self.complete:
-                break
-            after = (self.cursor, self.tracked, self.win_start, self.last_run_end)
-            if after == before and self.last_run_end >= self.buf.n - FRAME:
+        """Judge everything that was heard, in order, then build the final report."""
+        while True:
+            _msg, done = self.flush_step()
+            if done:
                 break
         return self.final_message()
 
@@ -1962,7 +2004,13 @@ def build_fastapi_app(runtime: ModelRuntime = RUNTIME):
                     if state["engine"].complete:
                         break
                 eng = state["engine"]
-                final = await asyncio.to_thread(eng.flush)
+                while True:                    # catch up on any backlog, streaming progress to the app
+                    msg, done = await asyncio.to_thread(eng.flush_step)
+                    if msg:
+                        await send(msg)
+                    if done:
+                        break
+                final = eng.final_message()
                 final["debug"] = debug_snapshot(eng, runtime)
                 await send(final)
             except Exception as exc:
@@ -2065,17 +2113,22 @@ if modal is not None:
     _fn_kwargs: Dict[str, Any] = dict(
         image=muaalem_image, cpu=float(NUM_THREADS), memory=4096, scaledown_window=10, timeout=900,
     )
+    if USE_MEMORY_SNAPSHOT:
+        _fn_kwargs["enable_memory_snapshot"] = True
     if USE_GPU:
         _fn_kwargs["gpu"] = "T4"
     _concurrent = getattr(modal, "concurrent", None)
     if _concurrent is None:                                  # very old Modal versions
-        _fn_kwargs["allow_concurrent_inputs"] = 8
+        _fn_kwargs["allow_concurrent_inputs"] = 4
 
     def _deploy(fn: Callable[[], Any]) -> Any:
         # Same as stacking:  @app.function(...)  @modal.concurrent(max_inputs=8)  @modal.asgi_app()
         fn = modal.asgi_app()(fn)
         if _concurrent is not None:
-            fn = _concurrent(max_inputs=8)(fn)
+            try:                                  # share one awake container between 2 reciters, then scale out
+                fn = _concurrent(max_inputs=4, target_inputs=2)(fn)
+            except TypeError:
+                fn = _concurrent(max_inputs=4)(fn)
         return app.function(**_fn_kwargs)(fn)
 
     @_deploy
@@ -2087,3 +2140,11 @@ if modal is not None:
         return build_fastapi_app(RUNTIME)
 else:  # pragma: no cover
     app = None
+
+# Memory snapshot: everything executed at import time inside the container (after the image is built) is
+# captured by Modal, so later cold starts restore a ready-to-serve model instead of loading it again.
+if modal is not None and USE_MEMORY_SNAPSHOT and hasattr(modal, "is_local") and not modal.is_local():
+    try:
+        RUNTIME.ensure_loaded()                   # loads the model and runs warm-up inferences
+    except Exception:
+        RUNTIME.load_error = traceback.format_exc()[-1500:]

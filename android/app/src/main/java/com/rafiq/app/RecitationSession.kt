@@ -70,6 +70,7 @@ class RecitationSession(
     @Volatile private var stopRequested = false
     @Volatile private var captureDone = false
     @Volatile private var finished = false
+    @Volatile private var captureStarted = false
     @Volatile private var attempts = 0
     private var record: AudioRecord? = null
 
@@ -99,11 +100,27 @@ class RecitationSession(
         }
         record = rec
         capturing = true
-        connect()
+        connect()                     // الالتقاط يبدأ عند وصول «ready» من الخادم (انظر beginCapture)
+        return true
+    }
+
+    /** يبدأ التقاط الصوت فقط حين يصبح الخادم جاهزاً، فلا يتراكم تسجيل طويل أثناء إيقاظه. */
+    private fun beginCapture() {
+        if (captureStarted || finished) return
+        val rec = record ?: return
+        captureStarted = true
         val t = Thread { captureLoop(rec) }
         t.name = "rafiq-capture"
         t.start()
-        return true
+    }
+
+    private fun releaseUnstartedRecorder() {
+        if (!captureStarted) {
+            try {
+                record?.release()
+            } catch (_: Exception) {
+            }
+        }
     }
 
     /** المستخدم ضغط «إيقاف»: نكمل إرسال ما التُقط ثم نطلب التقرير النهائي. */
@@ -123,6 +140,7 @@ class RecitationSession(
         }
         socket = null
         open = false
+        releaseUnstartedRecorder()
     }
 
     /** عدد ملّيثواني الصوت المنطوق (بعد حد الصمت) منذ لحظة audioMs من التسجيل. */
@@ -146,6 +164,9 @@ class RecitationSession(
         val shorts = ShortArray(chunk)
         var noise = 0.004f
         var voicedMs = 0L
+        var elapsedMs = 0L
+        var silentRun = 0
+        val preRoll = ArrayDeque<ByteArray>()
         try {
             rec.startRecording()
             while (capturing && !stopRequested && !finished) {
@@ -172,15 +193,43 @@ class RecitationSession(
                 if (rms < noise * 1.6f + 0.002f) noise = 0.95f * noise + 0.05f * rms
                 val thr = (noise * 3f).coerceIn(0.006f, 0.02f)
                 val voiced = rms >= thr
+                elapsedMs += 100L
+                val cumBefore = voicedMs
                 if (voiced) voicedMs += 100L
 
+                // بوابة الصمت: نحتفظ بالكلام + حتى 500ms من الصمت الطبيعي بعده، ونتجاوز الصمت الأطول،
+                // مع إعادة آخر 200ms قبل بدء الكلام التالي (حتى لا تُقطع بدايات الكلمات ولا مدّات الحروف).
+                val toSend = ArrayList<ByteArray>()
+                val cums = ArrayList<Long>()
+                if (voiced) {
+                    for (p in preRoll) {
+                        toSend.add(p)
+                        cums.add(cumBefore)
+                    }
+                    preRoll.clear()
+                    toSend.add(bytes)
+                    cums.add(voicedMs)
+                    silentRun = 0
+                } else {
+                    silentRun += 1
+                    if (silentRun <= HANGOVER_CHUNKS) {
+                        toSend.add(bytes)
+                        cums.add(cumBefore)
+                    } else {
+                        preRoll.addLast(bytes)
+                        if (preRoll.size > PREROLL_CHUNKS) preRoll.removeFirst()
+                    }
+                }
                 val audioMs = synchronized(lock) {
-                    chunks.add(bytes)
-                    voicedCum.add(voicedMs)
+                    for (i in toSend.indices) {
+                        chunks.add(toSend[i])
+                        voicedCum.add(cums[i])
+                    }
                     chunks.size * 100L
                 }
-                pump()
-                main.post { if (!finished) listener.onLevel(rms, voiced, audioMs) }
+                if (toSend.isNotEmpty()) pump()
+                val shownMs = elapsedMs
+                main.post { if (!finished) listener.onLevel(rms, voiced, shownMs) }
                 if (audioMs >= MAX_SESSION_MS && !stopRequested) {
                     stopRequested = true
                     main.post { if (!finished) listener.onAutoStop() }
@@ -273,6 +322,7 @@ class RecitationSession(
         when (o.optString("type")) {
             "ready" -> {
                 attempts = 0
+                beginCapture()
                 val arr = o.optJSONArray("words")
                 val ws = ArrayList<String>()
                 if (arr != null) for (i in 0 until arr.length()) ws.add(arr.optString(i, ""))
@@ -333,10 +383,13 @@ class RecitationSession(
     private fun fatal(message: String) {
         finished = true
         capturing = false
+        releaseUnstartedRecorder()
         main.post { listener.onFatal(message) }
     }
 
     companion object {
         private const val MAX_SESSION_MS = 300_000L   // 5 دقائق كحد أقصى
+        private const val HANGOVER_CHUNKS = 5          // 500ms صمت طبيعي بعد الكلام
+        private const val PREROLL_CHUNKS = 2           // 200ms قبل بدء الكلام التالي
     }
 }

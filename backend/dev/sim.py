@@ -117,7 +117,7 @@ def fake_groups(ph: str):
             phonemes=g,
             qalqla="moqalqal" if letter in "قطبجد" else "not_moqalqal",
             tafkheem_or_taqeeq="mofakham" if letter in "صضطظقغخر" else "moraqaq",
-            ghonna="maghnoon" if (letter in "نم" and len(g.replace(FATHA, "").replace(DAMMA, "").replace(KASRA, "")) > 1) else "not_maghnoon",
+            ghonna="maghnoon" if letter in "نم" else "not_maghnoon",
         ))
     return out
 
@@ -125,7 +125,8 @@ def fake_groups(ph: str):
 # ------------------------------------------------------------------ synthetic speaker
 class Speech:
     def __init__(self, ref, spoken: List[str], scale=1.0, pauses: Optional[Set[int]] = None,
-                 lead=1.0, junk: str = "", seed=1, noise_p=0.0, trail=1.5, stop_after: Optional[int] = None):
+                 lead=1.0, junk: str = "", seed=1, noise_p=0.0, trail=1.5, stop_after: Optional[int] = None,
+                 pause_s: float = 0.6):
         rnd = random.Random(seed)
         self.pauses = pauses or set()
         t = lead
@@ -145,7 +146,7 @@ class Speech:
                 self.chars.append((t + (i + 0.5) / max(1, len(s)) * d, ch, k))
             self.spans.append((t, t + d)); segs.append((t, t + d))
             t += d
-            t += (0.6 if k in self.pauses else rnd.uniform(0.01, 0.05))
+            t += (pause_s if k in self.pauses else rnd.uniform(0.01, 0.05))
         self.total = t + trail
         x = np.zeros(int(self.total * M.SR), dtype=np.float32)
         x += (np.random.default_rng(seed).standard_normal(x.size) * 0.0008).astype(np.float32)
@@ -221,3 +222,40 @@ def lag_stats(log, speech):
 
 def build_ref():
     return M.build_ref_aya(2, 255, FakeLib())
+
+
+# ------------------------------------------------------------------ mirror of the Android silence gate
+def client_trim(speech: "Speech", hangover=5, preroll=2):
+    """Same algorithm as RecitationSession.captureLoop: speech + up to 500 ms of silence are kept, longer
+    silence is dropped except the last 200 ms before the next word (pre-roll). Returns a remapped Speech."""
+    import copy
+    chunk = M.SR // 10
+    x = speech.audio
+    n = len(x) // chunk
+    noise, silent, pre, kept = 0.004, 0, [], []
+    for i in range(n):
+        seg = x[i * chunk:(i + 1) * chunk].astype("float64")
+        rms = float((seg ** 2).mean() ** 0.5)
+        if rms < noise * 1.6 + 0.002:
+            noise = 0.95 * noise + 0.05 * rms
+        voiced = rms >= min(max(noise * 3, 0.006), 0.02)
+        if voiced:
+            kept.extend(pre); pre = []; kept.append(i); silent = 0
+        else:
+            silent += 1
+            if silent <= hangover: kept.append(i)
+            else:
+                pre.append(i)
+                if len(pre) > preroll: pre.pop(0)
+    kept = sorted(set(kept))
+    new_index = {old: new for new, old in enumerate(kept)}
+    def remap(t):
+        c = int(t * 10)
+        while c not in new_index and c < n: c += 1          # snap into the next kept chunk
+        return (new_index.get(c, len(kept)) + (t * 10 - int(t * 10))) / 10.0
+    out = copy.copy(speech)
+    out.audio = np.concatenate([x[i * chunk:(i + 1) * chunk] for i in kept]) if kept else x[:0]
+    out.chars = [(remap(tm), ch, w) for (tm, ch, w) in speech.chars]
+    out.spans = [(remap(a), remap(b)) for (a, b) in speech.spans]
+    out.total = len(out.audio) / M.SR
+    return out

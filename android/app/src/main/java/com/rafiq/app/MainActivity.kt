@@ -65,7 +65,7 @@ class MainActivity : ComponentActivity() {
 fun RafiqApp(c: RafiqController) {
     val ctx = LocalContext.current
     val view = LocalView.current
-    SideEffect { view.keepScreenOn = (c.stage == Stage.LISTENING) }
+    SideEffect { view.keepScreenOn = (c.stage == Stage.LISTENING || c.stage == Stage.STARTING) }
 
     var selected by remember { mutableStateOf<Int?>(null) }
     var showSettings by remember { mutableStateOf(false) }
@@ -79,6 +79,8 @@ fun RafiqApp(c: RafiqController) {
     val onMic: () -> Unit = {
         if (c.stage == Stage.LISTENING) {
             c.stopRecitation()
+        } else if (c.stage == Stage.STARTING) {
+            c.cancelStart()
         } else if (c.stage != Stage.FINISHING) {
             if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) ==
                 PackageManager.PERMISSION_GRANTED
@@ -321,7 +323,7 @@ fun BottomArea(c: RafiqController, onMic: () -> Unit) {
         }
         Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
             Box(Modifier.align(Alignment.CenterStart)) {
-                val busyOrListening = c.stage == Stage.LISTENING || c.stage == Stage.FINISHING
+                val busyOrListening = c.stage == Stage.LISTENING || c.stage == Stage.FINISHING || c.stage == Stage.STARTING
                 if (!busyOrListening) {
                     Text(
                         if (c.playing) "⏹ إيقاف" else "🔊 استمع",
@@ -355,6 +357,7 @@ fun BottomArea(c: RafiqController, onMic: () -> Unit) {
 fun MicButton(c: RafiqController, onMic: () -> Unit) {
     val listening = c.stage == Stage.LISTENING
     val busy = c.stage == Stage.FINISHING
+    val starting = c.stage == Stage.STARTING
     val ring by animateFloatAsState(
         targetValue = if (listening) (c.level * 10f).coerceIn(0f, 1f) else 0f,
         label = "ring"
@@ -376,7 +379,7 @@ fun MicButton(c: RafiqController, onMic: () -> Unit) {
                 .background(if (listening) RedLetters else Gold)
                 .clickable(enabled = !busy) { onMic() }
         ) {
-            if (busy) {
+            if (busy || starting) {
                 CircularProgressIndicator(
                     color = Bg,
                     strokeWidth = 3.dp,

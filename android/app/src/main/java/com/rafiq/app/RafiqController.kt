@@ -26,7 +26,7 @@ data class Summary(
     val total: Int
 )
 
-enum class Stage { IDLE, LISTENING, FINISHING, DONE }
+enum class Stage { IDLE, STARTING, LISTENING, FINISHING, DONE }
 
 /**
  * يجمع حالة الشاشة كلها. الفكرة:
@@ -124,7 +124,7 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
     // ------------------------------------------------------------------ التلاوة
 
     fun startRecitation() {
-        if (stage == Stage.LISTENING || stage == Stage.FINISHING) return
+        if (stage == Stage.STARTING || stage == Stage.LISTENING || stage == Stage.FINISHING) return
         stopReference()
         resetRun()
         val s = RecitationSession(appContext, strictness, this)
@@ -133,9 +133,11 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
             return
         }
         session = s
-        stage = Stage.LISTENING
-        glow = 0
-        message = if (serverState == 1) "تفضّل بالتلاوة…" else "الخادم يستيقظ (حتى نصف دقيقة)… ابدأ التلاوة وسنلحق بك"
+        val warm = serverState == 1
+        stage = Stage.STARTING
+        glow = -1
+        if (serverState == 3) serverState = 0
+        message = if (warm) "جارٍ الاتصال بالخادم…" else "الخادم يستيقظ… انتظر لحظات (حتى نصف دقيقة) ثم ابدأ التلاوة"
     }
 
     fun stopRecitation() {
@@ -146,12 +148,22 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
         level = 0f
         s.stop()
         main.removeCallbacks(finalTimeout)
-        main.postDelayed(finalTimeout, 40000L)
+        main.postDelayed(finalTimeout, 150000L)
+    }
+
+    /** المستخدم ضغط الميكروفون أثناء انتظار الخادم: نلغي البدء. */
+    fun cancelStart() {
+        if (stage != Stage.STARTING) return
+        session?.abort()
+        session = null
+        stage = Stage.IDLE
+        message = ""
+        afterSession()
     }
 
     fun cancelIfActive() {
         stopReference()
-        if (stage == Stage.LISTENING) stopRecitation()
+        if (stage == Stage.STARTING) cancelStart() else if (stage == Stage.LISTENING) stopRecitation()
     }
 
     fun release() {
@@ -190,6 +202,7 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
 
     override fun onConnection(state: Int) {
         connection = state
+        if (stage == Stage.STARTING && state == 2) message = "إعادة محاولة الاتصال بالخادم…"
         if (stage == Stage.LISTENING) {
             if (state == 2) message = "انقطع الاتصال… نعيد المحاولة تلقائياً (لا تتوقف عن التلاوة)"
             else if (state == 1 && message.startsWith("انقطع")) message = "تفضّل بالتلاوة…"
@@ -203,7 +216,11 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
             this.words = words
             results = List(words.size) { null }
         }
-        if (stage == Stage.LISTENING && message.startsWith("الخادم يستيقظ")) message = "تفضّل بالتلاوة…"
+        if (stage == Stage.STARTING) {            // الخادم جاهز: يبدأ الالتقاط الآن
+            stage = Stage.LISTENING
+            glow = 0
+            message = "تفضّل بالتلاوة…"
+        }
     }
 
     override fun onProgress(tracked: Int, committed: Int, audioMs: Long, updates: List<WordResult>) {

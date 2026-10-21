@@ -238,6 +238,142 @@ def sifat_pad(preset):
     return flagged(eng.flush())
 check("sifat: [PAD] / prob 0.0 predictions never flag a word", sifat_pad("strict") == {})
 
+
+# ====================================================================== v14.3: regression tests from the live report
+import re as _re
+# ---- the live failure: a recitation recorded while the server was cold-starting arrives as one big backlog
+def backlog_run(preset="strict", burst_s=50.0, chunk_s=10.0, spoken=None):
+    """~50 s of audio recorded while the server was cold-starting arrives at once, then the rest trickles in."""
+    sp = sim.Speech(ref, spoken or BASE, scale=2.0, pauses=PAUSES, seed=21, lead=10.0, pause_s=1.2)
+    holder = {}; eng = M.SessionEngine(ref, sp.recognizer(holder), M.get_preset(preset)); holder["engine"] = eng
+    eng.add_audio(sp.audio[: int(burst_s * M.SR)]); t = burst_s
+    if eng.ready_to_run(): eng.step()
+    while t < sp.total:
+        eng.add_audio(sp.audio[int(t * M.SR): int((t + chunk_s) * M.SR)]); t += chunk_s
+        if eng.ready_to_run(): eng.step()                 # ONE window per arrival -> the backlog stays large
+    return eng, eng.flush(), sp
+eng, fin, sp = backlog_run()
+check("live failure: a %.0f s recitation delivered as a growing backlog is judged completely (50/50)" % sp.total,
+      fin["summary"]["judged"] == 50 and fin["summary"]["complete"] and not flagged(fin), fin["summary"])
+saved = M.MAX_BACKLOG_S
+M.MAX_BACKLOG_S = 45.0                                    # the v14.2 limit: this must FAIL (proves the test is meaningful)
+eng_old, fin_old, _sp = backlog_run()
+M.MAX_BACKLOG_S = saved
+check("live failure: the old 45 s limit really did strand words (test is meaningful)", fin_old["summary"]["judged"] < 40, fin_old["summary"]["judged"])
+
+# ---- adjacent swapped sifat labels (the live report: meem loses ghunna, next lam gains it) are not mistakes
+def sifat_custom(mutate, preset="strict"):
+    sp = sim.Speech(ref, BASE, pauses=PAUSES, seed=5); holder = {}; plain = sp.recognizer(holder)
+    def rec(wave):
+        r = plain(wave); groups = sim.fake_groups(r.text); items = []
+        for g in groups:
+            items.append({"phonemes_group": g.phonemes,
+                          "qalqla": types.SimpleNamespace(text=g.qalqla, prob=0.97),
+                          "tafkheem_or_taqeeq": types.SimpleNamespace(text=g.tafkheem_or_taqeeq, prob=0.97),
+                          "ghonna": types.SimpleNamespace(text=g.ghonna, prob=0.97)})
+        mutate(items)
+        return M.Recognition(r.text, r.probs, M.convert_sifat(items))
+    eng = M.SessionEngine(ref, rec, M.get_preset(preset)); holder["engine"] = eng
+    t = 0.0
+    while t < sp.total and not eng.complete:
+        eng.add_audio(sp.audio[int(t * M.SR): int((t + 0.1) * M.SR)]); t += 0.1
+        if eng.ready_to_run(): eng.step()
+    return flagged(eng.flush())
+def lbl(items, i, key, text): items[i][key] = types.SimpleNamespace(text=text, prob=0.97)
+APPLIED = {"n": 0}
+def first_letter(g): return next((c for c in g if not M.is_mark(c)), "")
+def candidates(items):
+    """(i, i+1): a noon/meem group followed by a group of a letter that can never carry ghunna"""
+    return [i for i in range(len(items) - 1)
+            if first_letter(items[i]["phonemes_group"]) in "نم"
+            and first_letter(items[i + 1]["phonemes_group"]) not in "نمويى" and first_letter(items[i + 1]["phonemes_group"])]
+def swap_pair(items):
+    for i in candidates(items):
+        lbl(items, i, "ghonna", "not_maghnoon"); lbl(items, i + 1, "ghonna", "maghnoon"); APPLIED["n"] += 1
+def only_first(items):
+    for i in candidates(items):
+        lbl(items, i, "ghonna", "not_maghnoon"); APPLIED["n"] += 1
+def extra_on_plain(items):
+    for i in range(len(items)):
+        if first_letter(items[i]["phonemes_group"]) in "لتبفكس":
+            lbl(items, i, "ghonna", "maghnoon"); APPLIED["n"] += 1
+APPLIED["n"] = 0
+g_swap = sifat_custom(swap_pair); n_swap = APPLIED["n"]
+check("sifat: swapped neighbouring ghunna labels (live report w6/w7) are not flagged (mutation applied %d times)" % n_swap,
+      n_swap > 10 and g_swap == {}, (n_swap, list(g_swap)))
+APPLIED["n"] = 0
+g_one = sifat_custom(only_first); n_one = APPLIED["n"]
+check("sifat: a genuinely missing ghunna (no neighbour swap) is still flagged (applied %d times)" % n_one,
+      n_one > 10 and any("ghonna" in kinds(w) for w in g_one.values()), (n_one, list(g_one)))
+APPLIED["n"] = 0
+g_extra = sifat_custom(extra_on_plain); n_extra = APPLIED["n"]
+check("sifat: 'ghunna' on ل/ت/ب/ف/ك/س is impossible and never flagged (applied %d times)" % n_extra,
+      n_extra > 10 and g_extra == {}, (n_extra, list(g_extra)))
+# prove the guards are what make those pass: with the guards disabled the same mutations DO flag words
+_sg, _sh = M.GHUNNA_LETTERS, M.SessionEngine._label_shift
+M.GHUNNA_LETTERS = set("ءابتثجحخدذرزسشصضطظعغفقكلمنهوي"); M.SessionEngine._label_shift = lambda *a, **k: False
+g_nog = sifat_custom(swap_pair); g_nog2 = sifat_custom(extra_on_plain)
+M.GHUNNA_LETTERS, M.SessionEngine._label_shift = _sg, _sh
+check("sifat: with the guards disabled those same mutations are flagged (the tests have teeth)", len(g_nog) > 0 and len(g_nog2) > 0, (len(g_nog), len(g_nog2)))
+
+# ---- a final vowel kept while the stop form is cheaper: report the VOWEL mistake, not 'vowel on a sukun'
+iss = M.judge_word(["تَءخُذُهُۥۥ", "تَءخُذُه"], "تَءخُذُهَاا", None, M.get_preset("strict"))[0]
+check("live log w8 (تَأْخُذُهُ said ـهَا): one clear vowel_swap on ه (not 'vowel on a sukun')",
+      [(i.t, i.k) for i in iss] == [("tashkeel", "vowel_swap")] and "«ه»" in iss[0].n, [(i.t, i.k) for i in iss])
+
+# ---- client silence gate: dead air is dropped, but pauses/word edges/madd are untouched
+for lbl_, kw in (("long 3 s pauses + 4 s lead/trail", dict(pause_s=3.0, lead=4.0, trail=4.0)),
+                 ("normal pauses", dict(pause_s=0.6, lead=1.0, trail=1.5))):
+    sp0 = sim.Speech(ref, BASE, pauses=PAUSES, seed=3, **kw)
+    sp1 = sim.client_trim(sp0)
+    saved_pct = 100.0 * (1 - len(sp1.audio) / len(sp0.audio))
+    eng, log, fin, _ = sim.run_stream(ref, sp1, preset="strict")
+    check("silence gate (%s): saves %.0f%% of the audio and the verdict is unchanged (50 ok)" % (lbl_, saved_pct),
+          fin["summary"]["ok"] == 50 and not flagged(fin) and (saved_pct > 25 if "long" in lbl_ else True), (fin["summary"], saved_pct))
+spoken, exp = inject(BASE)
+sp1 = sim.client_trim(sim.Speech(ref, spoken, pauses=PAUSES, seed=5, pause_s=3.0, lead=4.0, trail=4.0))
+eng, log, fin, _ = sim.run_stream(ref, sp1, preset="strict"); got = flagged(fin)
+check("silence gate: all 6 injected mistakes still found, nothing extra", set(got) == set(exp), (sorted(got), sorted(exp)))
+for pause, expect in ((True, set()), (False, {9})):
+    spoken9 = list(BASE); spoken9[9] = ref.waqf[9]
+    p = (set(PAUSES) | {9}) if pause else (set(PAUSES) - {9})
+    sp1 = sim.client_trim(sim.Speech(ref, spoken9, pauses=p, seed=7, pause_s=3.0))
+    eng, log, fin, _ = sim.run_stream(ref, sp1, preset="strict")
+    check("silence gate keeps the stop-form logic exact (%s a real pause)" % ("with" if pause else "without"),
+          set(flagged(fin)) == expect, list(flagged(fin)))
+
+# ---- Android <-> backend contract audit
+HERE = os.path.dirname(os.path.abspath(__file__))
+kt_dir = os.path.join(HERE, "..", "..", "android", "app", "src", "main", "java", "com", "rafiq", "app")
+kt = open(os.path.join(kt_dir, "RecitationSession.kt"), encoding="utf-8").read()
+cfg_kt = open(os.path.join(kt_dir, "RecitationConfig.kt"), encoding="utf-8").read()
+kotlin_keys = set(_re.findall(r'opt(?:String|Int|Long|Boolean|JSONArray|JSONObject)\("([A-Za-z_]+)"', kt))
+spoken, exp = inject(BASE)
+eng, log, fin, _ = sim.run_stream(ref, sim.Speech(ref, spoken, pauses=PAUSES, seed=5), preset="strict")
+msgs = [m for _t, m in log] + [fin]
+fin_ws = None
+def all_keys(o, acc):
+    if isinstance(o, dict):
+        for k, v in o.items(): acc.add(k); all_keys(v, acc)
+    elif isinstance(o, list):
+        for v in o: all_keys(v, acc)
+    return acc
+server_keys = set()
+for m_ in msgs: all_keys(m_, server_keys)
+server_keys |= {"words", "type"}        # 'ready' carries the word list (checked by the websocket test above)
+final_msg = dict(eng.final_message()); final_msg["debug"] = M.debug_snapshot(eng, sim_runtime := types.SimpleNamespace(status=lambda: {}))
+all_keys(final_msg, server_keys)
+missing = sorted(k for k in kotlin_keys if k not in server_keys and k != "message")
+check("contract: every JSON field the Android app reads exists in the server messages", not missing, missing)
+check("contract: server sends the 'message' field of error messages", '"message"' in open(os.path.join(HERE, "..", "modal_app.py"), encoding="utf-8").read())
+check("contract: app sends {\"type\":\"stop\"} and the server understands it",
+      '{\\"type\\":\\"stop\\"}' in kt and 'kind == "stop"' in open(os.path.join(HERE, "..", "modal_app.py"), encoding="utf-8").read())
+check("contract: websocket query parameters match", all(k in cfg_kt for k in ("sura_idx=", "aya_idx=", "strictness="))
+      and all(('qp.get("%s"' % k) in open(os.path.join(HERE, "..", "modal_app.py"), encoding="utf-8").read() for k in ("sura_idx", "aya_idx", "strictness")))
+check("contract: audio is 16 kHz mono PCM16 little-endian on both sides",
+      "SAMPLE_RATE: Int = 16000" in cfg_kt and "SR = 16000" in open(os.path.join(HERE, "..", "modal_app.py"), encoding="utf-8").read()
+      and "(s shr 8) and 0xFF" in kt and 'dtype="<i2"' in open(os.path.join(HERE, "..", "modal_app.py"), encoding="utf-8").read())
+
 # ---------------------------------------------------------------- real WebSocket handler with a fake socket
 fa = types.ModuleType("fastapi")
 class FastAPI:
@@ -291,6 +427,16 @@ async def ws_abrupt():
     for i in range(30):
         await ws.q.put({"type": "websocket.receive", "bytes": (sp.audio[i*1600:(i+1)*1600] * 32767).astype("<i2").tobytes()}); await asyncio.sleep(0.003)
     await ws.q.put({"type": "websocket.disconnect"}); await asyncio.wait_for(task, 10)
+async def ws_burst():
+    sp = sim.Speech(ref, BASE, pauses=PAUSES, seed=5)
+    handler = M.build_fastapi_app(FakeRuntime(sp)).routes[("websocket", "/ws/live-recitation")]
+    ws = FakeWS({"sura_idx": "2", "aya_idx": "255", "strictness": "strict"}); task = asyncio.create_task(handler(ws))
+    pcm = (sp.audio * 32767).astype("<i2").tobytes()
+    for i in range(0, len(pcm), 3200 * 10):
+        await ws.q.put({"type": "websocket.receive", "bytes": pcm[i:i + 3200 * 10]})
+    await ws.q.put({"type": "websocket.receive", "text": json.dumps({"type": "stop"})})
+    await asyncio.wait_for(task, 60)
+    return ws, [m for m in ws.sent if m["type"] == "final"]
 async def ws_all():
     ws, fin = await ws_case(None)
     kinds_ = [m["type"] for m in ws.sent]
@@ -301,6 +447,10 @@ async def ws_all():
           "debug" in fin[0] and "ref_info" in fin[0]["debug"] and len(fin[0]["debug"]["steps"]) > 0)
     ws, fin = await ws_case(14.0)
     check("websocket: stop button -> final with judged words, then closed", len(fin) == 1 and 15 <= fin[0]["summary"]["judged"] <= 24 and ws.closed, fin[:1])
+    ws, fin = await ws_burst()
+    prog = [m for m in ws.sent if m["type"] == "progress"]
+    check("websocket: whole recording sent at once then stop -> progress keeps streaming while catching up, final is complete",
+          len(prog) >= 4 and len(fin) == 1 and fin[0]["summary"]["judged"] == 50, (len(prog), fin[:1]))
     await ws_abrupt(); check("websocket: abrupt network drop ends the handler cleanly", True)
 asyncio.run(ws_all())
 
