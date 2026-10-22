@@ -374,6 +374,126 @@ check("contract: audio is 16 kHz mono PCM16 little-endian on both sides",
       "SAMPLE_RATE: Int = 16000" in cfg_kt and "SR = 16000" in open(os.path.join(HERE, "..", "modal_app.py"), encoding="utf-8").read()
       and "(s shr 8) and 0xFF" in kt and 'dtype="<i2"' in open(os.path.join(HERE, "..", "modal_app.py"), encoding="utf-8").read())
 
+
+# ====================================================================== v14.3b: Hafs policy, ghunna symbol, ibtida', sub-phonemic
+S_, B_, R_ = M.get_preset("strict"), M.get_preset("balanced"), M.get_preset("relaxed")
+def mkk(exp, seg, p): return [i.k for i in M.judge_word([exp], seg, None, p)[0]]
+# madd munfasil / silah kubra: 2 (qasr) .. 5 are all valid in Hafs 'an 'Asim; < 2 or > 5 is an error
+munf = "لَاااا"
+check("hafs: madd munfasil with 2 harakat (qasr) is valid in every preset",
+      all(mkk(munf, "لَاا", p) == [] for p in (S_, B_, R_)))
+check("hafs: madd munfasil 4 and 5 harakat are valid", all(mkk(munf, "لَ" + "ا" * n, S_) == [] for n in (4, 5)))
+check("hafs: madd munfasil dropped to 1 harakah is an error", mkk(munf, "لَا", S_) == ["madd_short"])
+check("hafs: madd munfasil stretched past 5: strict flags 6, balanced tolerates 6 but flags 7",
+      mkk(munf, "لَ" + "ا" * 6, S_) == ["madd_long"] and mkk(munf, "لَ" + "ا" * 6, B_) == []
+      and mkk(munf, "لَ" + "ا" * 7, B_) == ["madd_long"])
+silah = "عِںںںدَهُۥۥۥۥ"
+check("hafs: silah kubra with 2 harakat (live report w23) is valid", all(mkk(silah, "عِںںںدَهُۥۥ", p) == [] for p in (S_, B_, R_)))
+check("hafs: madd muttasil still needs 4 (2 is an error)", mkk("شَااااءَ", "شَااءَ", S_) == ["madd_short"] and mkk("شَااااءَ", "شَااااءَ", S_) == [])
+arid = "لعَظِۦۦۦۦم"
+check("hafs: madd 'arid at a stop is valid at 2, 4 and 6 (7 flagged)",
+      all(mkk(arid, "لعَظِ" + "ۦ" * n + "م", S_) == [] for n in (2, 4, 6)) and mkk(arid, "لعَظِ" + "ۦ" * 7 + "م", S_) == ["madd_long"])
+# ghunna symbol runs (ikhfaa): ںںں in the live output
+ikh = "مَںںںذَ"
+check("ghunna ikhfaa: exact length ok; one short -> strict flags; two short -> balanced+strict flag; relaxed tolerates",
+      all(mkk(ikh, ikh, p) == [] for p in (S_, B_, R_))
+      and mkk(ikh, "مَںںذَ", S_) == ["ghunna_short"] and mkk(ikh, "مَںںذَ", B_) == []
+      and mkk(ikh, "مَںذَ", B_) == ["ghunna_short"] and mkk(ikh, "مَںذَ", S_) == ["ghunna_short"] and mkk(ikh, "مَںذَ", R_) == [])
+check("ghunna ikhfaa: ikhfaa not applied at all (noon instead of the ghunna symbol) is a tajweed 'rule' error",
+      mkk(ikh, "مَنذَ", S_) == ["rule"])
+# liin letter stretched like a madd (ya of بَيْنَ)
+check("liin letter: بَيْنَ with an elongated ya -> strict flags, balanced tolerates 2 but flags 3",
+      mkk("بَينَ", "بَينَ", S_) == [] and mkk("بَينَ", "بَيينَ", S_) == ["lin_extended"]
+      and mkk("بَينَ", "بَيينَ", B_) == [] and mkk("بَينَ", "بَييينَ", B_) == ["lin_extended"])
+
+# ---- vowel on a different letter is alignment drift (stutter after a stop), a real swap on the same letter is not
+check("drift: a heard vowel that belongs to another letter is not a vowel_swap",
+      M.judge_word(["لءَرضِ"], "لءَرضمَن", None, S_, lead=0, trail=3)[0] == []
+      and [i.k for i in M.judge_word(["لءَرضِ"], "لءَرضَ", None, S_)[0]] == ["vowel_swap"])
+# the same alignment-drift case at window level: reciter stops, then repeats the next word
+st_ = list(BASE); st_[20] = st_[19] + st_[20]
+eng_, log_, fin_, sp_ = sim.run_stream(ref, sim.Speech(ref, st_, pauses=PAUSES, seed=18), preset="strict")
+check("drift: stop + repeating the next word is judged clean (50 ok, strict)", fin_["summary"]["ok"] == 50 and not flagged(fin_), {w: kinds(x) for w, x in flagged(fin_).items()})
+
+# ---- ibtida' (start) forms: after a pause the word starts fresh (live report w11->w12: tanween idgham not applied)
+check("ibtida': start forms were computed (hamzat al-wasl / no assimilation)", ref.info.get("start_forms", 0) >= 6, ref.info.get("start_forms"))
+check("ibtida': لَهُ after a paused نَوْمٌ has a distinct start form (single lam, not the idgham 'لل')",
+      ref.start_forms[12] and ref.start_forms[12] != ref.wasl[12] and ref.wasl[12].startswith("لل") and not ref.start_forms[12].startswith("لل"),
+      (ref.wasl[12], ref.start_forms[12]))
+def with_ibtida(r, pauses):
+    out = []
+    for k in range(r.n):
+        after, at = (k - 1) in pauses, k in pauses
+        if after and at: f = r.start_waqf[k] or r.start_forms[k] or r.waqf[k] or r.wasl[k]
+        elif after: f = r.start_forms[k] or r.wasl[k]
+        elif at: f = r.waqf[k] or r.wasl[k]
+        else: f = r.wasl[k]
+        out.append(f)
+    return out
+IB_PAUSES = PAUSES | {9, 11}
+spoken_ib = with_ibtida(ref, IB_PAUSES)
+eng, log, fin, sp = sim.run_stream(ref, sim.Speech(ref, spoken_ib, pauses=IB_PAUSES, seed=31), preset="strict")
+check("ibtida': a recitation that restarts words fresh after every pause is 50/50 correct (strict)",
+      fin["summary"]["ok"] == 50 and not flagged(fin), (fin["summary"], {w: kinds(x) for w, x in flagged(fin).items()}))
+saved_sf, saved_sw = list(ref.start_forms), list(ref.start_waqf)
+ref.start_forms, ref.start_waqf = [None] * ref.n, [None] * ref.n
+eng, log, fin_no, sp = sim.run_stream(ref, sim.Speech(ref, spoken_ib, pauses=IB_PAUSES, seed=31), preset="strict")
+ref.start_forms, ref.start_waqf = saved_sf, saved_sw
+check("ibtida': without start forms the same correct recitation IS falsely flagged (the test has teeth)", len(flagged(fin_no)) > 0, len(flagged(fin_no)))
+
+
+# ---- a fresh start without a stop: hamzat al-wasl pronounced / idgham not applied in continuous reading
+def fresh_start_case(preset, k, pause_before):
+    spoken = list(BASE); spoken[k] = ref.start_forms[k]
+    p = set(PAUSES); p = (p | {k - 1}) if pause_before else (p - {k - 1})
+    if not pause_before:
+        spoken[k - 1] = ref.wasl[k - 1]          # no stop: the previous word is spoken in its continuing form
+    eng, log, fin, sp = sim.run_stream(ref, sim.Speech(ref, spoken, pauses=p, seed=41), preset=preset)
+    return flagged(fin)
+g1 = fresh_start_case("strict", 5, pause_before=False)                      # الْحَيُّ said as ءَلحَيّ right after هُوَ
+check("hamzat al-wasl pronounced in continuous reading (strict): flagged as a tajweed 'start_no_pause'",
+      list(g1) == [5] and g1[5]["s"] == "tajweed" and kinds(g1[5]) == ["start_no_pause"], {w: (x["s"], kinds(x)) for w, x in g1.items()})
+check("the same fresh start AFTER a real stop is correct (no flag)", fresh_start_case("strict", 5, pause_before=True) == {})
+check("balanced does not apply the start-without-pause check (conservative default)", fresh_start_case("balanced", 5, pause_before=False) == {})
+g2 = fresh_start_case("strict", 12, pause_before=False)                     # لَهُ said with a single lam although نَوْمٌ was not stopped on
+check("idgham not applied after نَوْمٌ in continuous reading (strict): flagged", 12 in g2 and "start_no_pause" in kinds(g2[12]), {w: kinds(x) for w, x in g2.items()})
+
+# ---- strict: sub-phonemic mistakes (right phoneme, wrong articulation) via the other sifat levels
+def sifat_generic(preset, letter, key, new_label):
+    sp = sim.Speech(ref, BASE, pauses=PAUSES, seed=5); holder = {}; plain = sp.recognizer(holder)
+    def rec(wave):
+        r = plain(wave); items = []
+        for g in sim.fake_groups(r.text):
+            L = next((c for c in g.phonemes if not M.is_mark(c)), "")
+            d = {"phonemes_group": g.phonemes}
+            for lv in ("qalqla", "tafkheem_or_taqeeq", "ghonna", "hams_or_jahr"):
+                lab = getattr(g, lv)
+                if lv == key and L == letter: lab = new_label
+                d[lv] = types.SimpleNamespace(text=lab, prob=0.95)
+            items.append(d)
+        return M.Recognition(r.text, r.probs, M.convert_sifat(items))
+    eng = M.SessionEngine(ref, rec, M.get_preset(preset)); holder["engine"] = eng
+    t = 0.0
+    while t < sp.total and not eng.complete:
+        eng.add_audio(sp.audio[int(t * M.SR): int((t + 0.1) * M.SR)]); t += 0.1
+        if eng.ready_to_run(): eng.step()
+    return flagged(eng.flush())
+g_s = sifat_generic("strict", "ب", "hams_or_jahr", "hams")
+g_b = sifat_generic("balanced", "ب", "hams_or_jahr", "hams")
+check("strict: ب articulated whispered (hams instead of jahr) is flagged as a sifa mistake; balanced ignores it",
+      len(g_s) > 0 and all(any(k.startswith("sifa:") for k in kinds(w)) for w in g_s.values()) and g_b == {}, (len(g_s), len(g_b)))
+
+
+check("contract: the app uploads to /analyze with the same form fields the server declares",
+      all(('addFormDataPart("%s"' % k) in kt for k in ("file", "sura_idx", "aya_idx", "strictness"))
+      and '@api.post("/analyze")' in open(os.path.join(HERE, "..", "modal_app.py"), encoding="utf-8").read()
+      and all(("%s: " % k) in open(os.path.join(HERE, "..", "modal_app.py"), encoding="utf-8").read().split("async def analyze(")[1].split(") ->")[0]
+              for k in ("file", "sura_idx", "aya_idx", "strictness"))
+      and 'fun analyzeUrl' in cfg_kt and '"/analyze"' in cfg_kt)
+check("contract: the uploaded WAV header matches what the server decodes (RIFF/WAVE, 16 kHz, mono, PCM16)",
+      all(s_ in kt for s_ in ('"RIFF"', '"WAVE"', "putInt(sampleRate)", "header.putShort(1)", "header.putShort(16)"))
+      and "decode_audio_bytes" in open(os.path.join(HERE, "..", "modal_app.py"), encoding="utf-8").read())
+
 # ---------------------------------------------------------------- real WebSocket handler with a fake socket
 fa = types.ModuleType("fastapi")
 class FastAPI:
@@ -453,6 +573,33 @@ async def ws_all():
           len(prog) >= 4 and len(fin) == 1 and fin[0]["summary"]["judged"] == 50, (len(prog), fin[:1]))
     await ws_abrupt(); check("websocket: abrupt network drop ends the handler cleanly", True)
 asyncio.run(ws_all())
+
+# ---- /analyze (record-then-upload) and the compact technical report
+import wave as _wave, io as _io
+class FakeUpload:
+    def __init__(self, data): self.data = data
+    async def read(self): return self.data
+def wav_bytes(x):
+    b = _io.BytesIO()
+    with _wave.open(b, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(M.SR); w.writeframes((x * 32767).astype("<i2").tobytes())
+    return b.getvalue()
+async def analyze_case():
+    spoken, exp = inject(BASE)
+    sp = sim.Speech(ref, spoken, pauses=PAUSES, seed=5, pause_s=2.0, lead=3.0, trail=3.0)
+    sp = sim.client_trim(sp)
+    handler = M.build_fastapi_app(FakeRuntime(sp)).routes[("post", "/analyze")]
+    res = await handler(file=FakeUpload(wav_bytes(sp.audio)), sura_idx=2, aya_idx=255, strictness="strict")
+    return res, exp
+res, exp_ = asyncio.run(analyze_case())
+got_ = {w["i"] for w in res["words"] if w["s"] != "ok"}
+check("/analyze: a trimmed WAV upload is judged completely (50 words) and finds the 6 mistakes, nothing extra",
+      res["summary"]["judged"] == 50 and got_ == set(exp_), (res["summary"], sorted(got_)))
+size_kb = len(json.dumps(res["debug"], ensure_ascii=False).encode("utf-8")) / 1024
+check("/analyze: the technical report has all 50 words and fits in a chat message (%.0f KB)" % size_kb,
+      len(res["debug"]["words"]) == 50 and size_kb < 60, size_kb)
+check("/analyze: response carries every field the app reads", all(k in res for k in ("type", "words", "summary", "debug")) and "complete" in res["summary"])
+
 
 print("\n%d check(s) failed" % len(FAILS) if FAILS else "\nALL CHECKS PASSED")
 sys.exit(1 if FAILS else 0)

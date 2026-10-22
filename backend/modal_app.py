@@ -127,7 +127,8 @@ PRESETS: Dict[str, Preset] = {
     "strict": Preset("strict", conf_letter=0.50, conf_vowel=0.50, conf_sifat=0.65,
                      short_slack=0, long_slack=0, flag_missing_vowel=True, flag_extra_vowel=True,
                      flag_extra_letter=True, flag_extra_shaddah=True, flag_waqf_no_pause=True,
-                     sifat_levels=("qalqla", "ghonna", "tafkheem_or_taqeeq")),
+                     sifat_levels=("qalqla", "ghonna", "tafkheem_or_taqeeq", "hams_or_jahr", "shidda_or_rakhawa",
+                                   "itbaq", "safeer", "tikraar", "tafashie", "istitala")),
 }
 
 
@@ -180,6 +181,7 @@ MAKHRAJ: Dict[str, str] = {
 }
 
 
+GHUNNA_SYMBOLS = set("ں")                # QPS symbol for ikhfaa / idgham ghunna (seen in live output: مَںںںذَ)
 GHUNNA_LETTERS = set("نمويى")          # only these can carry ghunna (noon, meem, idgham bi-ghunna)
 TAFKHEEM_LETTERS = set("رلصضطظقغخ")      # letters whose heaviness is a real tajweed question
 
@@ -344,6 +346,35 @@ def note_tafkheem(letter: str, expected_heavy: bool) -> str:
     return f"الترقيق: حقّ {l} الترقيق هنا؛ رقّقه بإخراج الصوت رقيقًا مع خفض مؤخرة اللسان."
 
 
+SIFA_AR = {
+    "hams_or_jahr": "الهمس والجهر", "shidda_or_rakhawa": "الشدة والرخاوة", "itbaq": "الإطباق والانفتاح",
+    "safeer": "الصفير", "tikraar": "التكرار", "tafashie": "التفشّي", "istitala": "الاستطالة",
+}
+
+
+def note_sifa(level: str, letter: str) -> str:
+    return (f"صفة «{SIFA_AR.get(level, 'الحرف')}» في «{letter}» لم تظهر كما ينبغي (تقدير دقيق من النموذج، "
+            f"قد يتأثر بالميكروفون). استمع للقارئ ثم أعد الكلمة بوضوح{hint(letter)}.")
+
+
+def note_ghunna_short(E: int) -> str:
+    return ("الغنة: قصّرتَ في غنّة الإخفاء/الإدغام. أخرج الصوت من الخيشوم بمقدار ثابت (نحو حركتين) "
+            "ولا تقطعه مبكرًا.")
+
+
+def note_ghunna_long() -> str:
+    return "الغنة: أطلتَ الغنة أكثر من اللازم. اقتصر على نحو حركتين."
+
+
+def note_start_no_pause() -> str:
+    return ("لا وقف قبل هذه الكلمة، فالقراءة وصلٌ بما قبلها: لا تبدأها من جديد (بنطق همزة الوصل، أو بترك "
+            "الإدغام/الإخفاء مع الكلمة السابقة). صِلها بما قبلها دون توقف.")
+
+
+def note_lin_extended(c: str) -> str:
+    return (f"حرف اللين «{c}» في هذه الكلمة لا مدّ فيه؛ مددتَه كأنه حرف مدّ. انطقه سريعًا بلا إطالة.")
+
+
 def note_sifa_generic(letter: str) -> str:
     l = f"«{letter}»" if letter in BASIC_LETTERS else "هذا الحرف"
     return f"صفة {l} لم تظهر كما ينبغي. استمع للقارئ ثم أعد قراءة الكلمة."
@@ -413,6 +444,7 @@ def align(
     M, L = len(ref), len(pred)
     ins = gap_costs(pred)
     dele = gap_costs(ref)
+    pred_mark = [is_mark(ch) for ch in pred]
     dp = [[0.0] * (L + 1) for _ in range(M + 1)]
     bt = [[0] * (L + 1) for _ in range(M + 1)]
     for j in range(1, L + 1):
@@ -424,8 +456,12 @@ def align(
         rc = ref[i - 1]
         di = dele[i - 1]
         prev, cur, btr = dp[i - 1], dp[i], bt[i]
+        rm = is_mark(rc)
         for j in range(1, L + 1):
-            d = prev[j - 1] + sub_cost(rc, pred[j - 1])
+            c = sub_cost(rc, pred[j - 1])
+            if rm and pred_mark[j - 1] and i >= 2 and j >= 2 and ref[i - 2] != pred[j - 2]:
+                c += 0.4                    # a vowel belongs to its letter: pair marks that follow the same letter
+            d = prev[j - 1] + c
             u = prev[j] + di
             v = cur[j - 1] + ins[j - 1]
             if d <= u and d <= v:
@@ -626,6 +662,8 @@ class RefAya:
         for k, f in enumerate(wasl):
             self.starts.append(self.starts[-1] + len(f))
             self.word_of_char.extend([k] * len(f))
+        self.start_forms: List[Optional[str]] = [None] * len(words)     # word said fresh after a pause (ibtida')
+        self.start_waqf: List[Optional[str]] = [None] * len(words)
         self.exp_groups = exp_groups
         self.group_of_char = group_index_map(exp_groups, self.full_ph)
         self.core: List[List[str]] = [collapse_runs(letters_only(f)) for f in wasl]
@@ -636,11 +674,28 @@ class RefAya:
             f.append(self.waqf[k])
         return f
 
+    def forms_ext(self, k: int) -> Tuple[List[str], Dict[str, str]]:
+        """All acceptable pronunciations of word k: continuing (wasl) or stopping (waqf) at its end, each
+        with or without the start-of-speech (ibtida') beginning; plus waqf->wasl partners for re-selection."""
+        forms = [self.wasl[k]]
+        partner: Dict[str, str] = {}
+        w, s, sw = self.waqf[k], self.start_forms[k], self.start_waqf[k]
+        if w and w not in forms:
+            forms.append(w)
+            partner[w] = self.wasl[k]
+        if s and s not in forms:
+            forms.append(s)
+        if sw and sw not in forms:
+            forms.append(sw)
+            partner[sw] = s or self.wasl[k]
+        return forms, partner
+
     def describe(self) -> Dict[str, Any]:
         return {
             "sura": self.sura, "aya": self.aya, "n_words": self.n, "approx_segmentation": self.approx,
             "sifat_available": self.group_of_char is not None, "info": self.info,
-            "words": [{"i": k, "text": self.words[k], "wasl": self.wasl[k], "waqf": self.waqf[k]}
+            "words": [{"i": k, "text": self.words[k], "wasl": self.wasl[k], "waqf": self.waqf[k],
+                       "start": self.start_forms[k]}
                       for k in range(self.n)],
         }
 
@@ -813,6 +868,38 @@ def build_ref_aya(sura: int, aya: int, lib: Any, with_waqf: bool = True) -> RefA
                 ok_cnt += 1
         info["waqf_forms"] = ok_cnt
 
+    # ---- start (ibtida') form: how the word sounds when the reciter begins fresh at it (after a pause):
+    #      hamzat al-wasl pronounced, no assimilation of the previous word's tanween / noon into it.
+    start_forms: List[Optional[str]] = [None] * n
+    start_waqf: List[Optional[str]] = [None] * n
+    if with_waqf and strategy != "proportional":
+        starts_ = [0]
+        for gr in groups:
+            starts_.append(starts_[-1] + len(gr))
+        cnt = 0
+        for k in range(1, n):
+            try:
+                P = clean_phonemes(lib.phonetize(" ".join(raw[tok_idx[k]:]), True).phonemes)
+            except Exception:
+                continue
+            rest = F[starts_[k + 1]:]
+            lcs = 0
+            while lcs < min(len(P), len(rest)) and P[len(P) - 1 - lcs] == rest[len(rest) - 1 - lcs]:
+                lcs += 1
+            if lcs < len(rest) - 1:
+                continue
+            sf = P[: len(P) - len(rest)] if rest else P
+            if sf and sf != groups[k] and abs(len(sf) - len(groups[k])) <= 6:
+                start_forms[k] = sf
+                cnt += 1
+                wq = waqf[k]
+                if wq:
+                    c0 = _lcp(groups[k], wq)
+                    tail_wasl, tail_waqf = groups[k][c0:], wq[c0:]
+                    if (not tail_wasl or sf.endswith(tail_wasl)) and tail_waqf != tail_wasl:
+                        start_waqf[k] = (sf[: len(sf) - len(tail_wasl)] if tail_wasl else sf) + tail_waqf
+        info["start_forms"] = cnt
+
     raw_sifat = getattr(full, "sifat", None)
     exp_groups = convert_sifat(raw_sifat)
     try:
@@ -822,6 +909,7 @@ def build_ref_aya(sura: int, aya: int, lib: Any, with_waqf: bool = True) -> RefA
     except Exception:
         pass
     ref = RefAya(sura, aya, words, groups, waqf, approx, full, exp_groups, uth, info, word_exact)
+    ref.start_forms, ref.start_waqf = start_forms, start_waqf
     info["sifat_tiles_reference"] = ref.group_of_char is not None
     return ref
 
@@ -885,9 +973,11 @@ def _need_text(lo: int, e: int) -> str:
 
 def madd_bounds(exp: str, s: int, e: int) -> Tuple[int, int]:
     """
-    Accepted number of harakat (lo, hi) for the madd run exp[s:e].  The live model counts agree with the
-    moshaf almost exactly (natural = 2, muttasil/munfasil = 4), so the base range is tight and the
-    preset slacks (short_slack / long_slack) decide how much extra is tolerated.
+    Accepted number of harakat (lo, hi) for the madd run exp[s:e], following Hafs 'an 'Asim:
+      madd munfasil & silah kubra : 2 (qasr, Tayyibat an-Nashr) .. 5 (tawassut/fuwayq, Shatibiyyah) all valid
+      madd muttasil               : 4 .. 6      madd lazim : 6        madd 'arid / lin at a stop : 2, 4 or 6
+      madd tabii / silah sughra / badal / 'iwad : exactly 2
+    The preset slacks (short_slack / long_slack) add tolerance on top.
     """
     E = e - s
     after = [ch for ch in exp[e:] if not is_mark(ch)]
@@ -898,10 +988,10 @@ def madd_bounds(exp: str, s: int, e: int) -> Tuple[int, int]:
     if muttasil and E >= 3:
         return 4, 6                              # muttasil
     if n_after == 0:
-        return (3, 7) if E >= 3 else (2, 2)      # munfasil / silah kubra  |  natural, silah sughra
+        return (2, 5) if E >= 3 else (2, 2)      # munfasil / silah kubra (2..5)  |  tabii, silah sughra
     if n_after == 1:
-        return (3, 7) if E >= 3 else (2, 6)      # ... | possible 'aarid madd at a stop (2/4/6)
-    return (3, 6) if E >= 3 else (2, 2)          # natural madd inside the word
+        return 2, 6                              # 'arid lil-sukoon / lin (2, 4, 6)
+    return (3, 6) if E >= 3 else (2, 2)          # inside the word
 
 
 def judge_word(
@@ -913,6 +1003,7 @@ def judge_word(
     trail: int = 0,
     approx: bool = False,
     ctx_chars: str = "",
+    partner: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[Issue], Optional[Alignment], str, Dict[str, float]]:
     """
     Compares ONE spoken word (`seg` = its predicted phonemes, with up to `lead`/`trail` chars of
@@ -930,13 +1021,15 @@ def judge_word(
         return [], None, "", form_costs
     exp, al = best
     uniq = [f for f in dict.fromkeys(x for x in forms if x)]
-    if len(uniq) > 1 and exp != uniq[0]:
+    if partner is None:
+        partner = {uniq[1]: uniq[0]} if len(uniq) == 2 else {}
+    if exp in partner:
         # a stop form won on cost, but if the reciter kept a final vowel he was NOT stopping:
         # judge against the continuation form so the vowel mistake is reported properly
         core_end = len(seg) - trail
         letter_idx = [i for i in range(lead, core_end) if not is_mark(seg[i]) and seg[i] not in ALWAYS_MADD]
         if letter_idx and any(seg[i] in CORE_VOWELS for i in range(letter_idx[-1] + 1, core_end)):
-            exp = uniq[0]
+            exp = partner[exp]
             al = align(exp, seg, tail_free_ref=False, pred_lead_free=lead, tail_ins_chars=trail)
     M, L = len(exp), len(seg)
     r2p = {ri: pj for ri, pj in al.pairs if ri >= 0 and pj >= 0}
@@ -969,6 +1062,8 @@ def judge_word(
         if pj is not None:
             pc = seg[pj]
             if pc != c and pc in CORE_VOWELS:
+                if owner and prev_letter(seg, pj) != owner:
+                    continue              # the heard vowel sits on a different letter: alignment drift, not a swap
                 issues.append(Issue("tashkeel", "vowel_swap", note_vowel_swap(owner, c, pc),
                                     _conf(probs, [pj]), ri, c, pc, owner))
             continue
@@ -1031,7 +1126,10 @@ def judge_word(
             issues.append(Issue("letters", "replace", note_replace(c, pc),
                                 _conf(probs, [sub_in_run[0]]), s, c, pc, c))
             continue
-        if _madd_is_run(exp, s, e):
+        if _madd_is_run(exp, s, e) and E == 1:
+            if p > 1 + preset.long_slack:          # a liin letter (e.g. the ya of بَيْنَ) stretched like a madd
+                issues.append(Issue("tajweed", "lin_extended", note_lin_extended(c), conf, s, c, c * p, c))
+        elif _madd_is_run(exp, s, e):
             lo, hi = madd_bounds(exp, s, e)
             if p < lo - preset.short_slack:
                 issues.append(Issue("tajweed", "madd_short", note_madd_short(c, _need_text(lo, E)),
@@ -1039,6 +1137,12 @@ def judge_word(
             elif p > hi + preset.long_slack:
                 issues.append(Issue("tajweed", "madd_long", note_madd_long(c, min(E, hi)),
                                     conf, s, c * E, c * p, c))
+        elif c in GHUNNA_SYMBOLS:
+            min_ok = E if preset.name == "strict" else ((2 if E == 2 else E - 1) if preset.name == "balanced" else 1)
+            if E >= 2 and p < min_ok:
+                issues.append(Issue("tajweed", "ghunna_short", note_ghunna_short(E), conf, s, c * E, c * p, ""))
+            elif p > E and preset.flag_extra_shaddah:
+                issues.append(Issue("tajweed", "ghunna_long", note_ghunna_long(), conf, s, c * E, c * p, ""))
         elif c in BASIC_LETTERS:
             if preset.name == "strict":
                 min_ok = E
@@ -1057,6 +1161,11 @@ def judge_word(
     first_core, last_core = lead, L - trail
     for pj in range(first_core + 1, last_core - 1):
         if pj in aligned_p:
+            continue
+        # 'interior' means real LETTERS are aligned on both sides (a vowel mark alone does not count)
+        before_ok = any(q in aligned_p and not is_mark(seg[q]) for q in range(first_core, pj))
+        after_ok = any(q in aligned_p and not is_mark(seg[q]) for q in range(pj + 1, last_core))
+        if not (before_ok and after_ok):
             continue
         pc = seg[pj]
         if pc in CORE_VOWELS and preset.flag_extra_vowel and (pj - 1) in aligned_p:
@@ -1202,6 +1311,7 @@ class SessionEngine:
         self.last_window: Tuple[int, int] = (0, 0)
         self.skip_mode = False
         self._flush_iters = 0
+        self.word_log: Dict[int, Dict[str, Any]] = {}
         self.debug: Dict[str, Any] = {
             "created": time.time(), "sura": ref.sura, "aya": ref.aya, "preset": preset.name,
             "approx_segmentation": ref.approx, "ref_info": ref.info, "meta": meta or {}, "steps": [],
@@ -1419,6 +1529,7 @@ class SessionEngine:
         updates: List[Dict[str, Any]] = []
         judged_dbg: List[Dict[str, Any]] = []
         for w in range(c, end_elig):
+            jinfo: Dict[str, Any] = {}
             if forced and w < first_matched_word:
                 self.results[w] = ("unchecked", [])
             elif w not in pj_of_word or cov(w) < WORD_SKIP_COV:
@@ -1430,7 +1541,8 @@ class SessionEngine:
             st, iss = self.results[w]
             updates.append(self._update_item(w))
             entry = {"w": w, "s": st, "issues": [i.to_debug() for i in iss]}
-            entry.update(locals().get("jinfo", {}) if st != "unchecked" else {})
+            entry.update(jinfo)
+            self.word_log[w] = entry
             judged_dbg.append(entry)
         dbg["judged"] = judged_dbg
         self.cursor = end_elig
@@ -1462,19 +1574,63 @@ class SessionEngine:
                 ctx += ref.wasl[w - 1][-2:]
             if w + 1 < ref.n:
                 ctx += ref.wasl[w + 1][:2]
+        forms, partner = ref.forms_ext(w)
         issues, _wal, form, costs = judge_word(
-            ref.forms(w), seg, seg_probs, self.preset,
-            lead=first - lo, trail=hi - last, approx=approx_w, ctx_chars=ctx)
+            forms, seg, seg_probs, self.preset,
+            lead=first - lo, trail=hi - last, approx=approx_w, ctx_chars=ctx, partner=partner)
         extra = self._waqf_without_pause(w, form, costs, pj_of_word, L, vsel)
         if extra is not None:
             issues = issues + [extra]
+        extra2 = self._start_without_pause(w, form, costs, pj_of_word, L, vsel)
+        if extra2 is not None:
+            issues = issues + [extra2]
         trace: List[Any] = []
         if self.preset.sifat_levels and ref.group_of_char is not None and pred_gmap is not None and rec.sifat:
             s_issues, trace = self._sifat_issues(w, al, base, ref_str, pred, pred_gmap, rec.sifat)
             issues = issues + s_issues
-        info = {"seg": seg, "exp": form, "form": "waqf" if (form != ref.wasl[w]) else "wasl",
+        label = ("wasl" if form == ref.wasl[w] else "waqf" if form == ref.waqf[w]
+                 else "start" if form == ref.start_forms[w] else "start+waqf")
+        info = {"seg": seg, "exp": form, "form": label,
                 "sifat_cmp": trace[:14], "exact": not approx_w}
         return issues[:3], info
+
+    def _silence_between(self, t_a: int, t_b: int, vsel: np.ndarray) -> Optional[bool]:
+        """True if >= 100 ms of silence lies within +-0.5 s of the boundary between two times; None = unknown."""
+        if len(vsel) < 6:
+            return None
+        lo_f = max(min(t_a, t_b) // FRAME - 25, int(vsel[0]))
+        hi_f = min(max(t_a, t_b) // FRAME + 25, int(vsel[-1]))
+        if hi_f - lo_f < 10:
+            return None
+        vset = set(int(x) for x in vsel)
+        run = best = 0
+        for f in range(lo_f, hi_f + 1):
+            if f in vset:
+                run = 0
+            else:
+                run += 1
+                best = max(best, run)
+        return best >= 5
+
+    def _start_without_pause(self, w: int, form: str, costs: Dict[str, float],
+                             pj_of_word: Dict[int, List[int]], L: int, vsel: np.ndarray) -> Optional[Issue]:
+        """The word was said as if starting fresh (hamzat al-wasl pronounced / no idgham with the previous word)
+        although the reciter did not stop before it: a tajweed mistake in continuous reading."""
+        ref = self.ref
+        starts = (ref.start_forms[w], ref.start_waqf[w])
+        if (not self.preset.flag_waqf_no_pause or w == 0 or form not in [s for s in starts if s]
+                or (w - 1) not in pj_of_word or w not in pj_of_word):
+            return None
+        cont = [f for f in (ref.wasl[w], ref.waqf[w]) if f]
+        if min(costs.get(f, 99.0) for f in cont) - costs.get(form, 99.0) < 0.12:
+            return None                    # the continuation form fits about as well: no evidence
+        t_prev = self._pred_to_sample(max(pj_of_word[w - 1]), L, vsel)
+        t_this = self._pred_to_sample(min(pj_of_word[w]), L, vsel)
+        if t_prev is None or t_this is None:
+            return None
+        if self._silence_between(t_prev, t_this, vsel) is not False:
+            return None
+        return Issue("tajweed", "start_no_pause", note_start_no_pause(), 0.9, 0, form, ref.wasl[w], "")
 
     def _waqf_without_pause(self, w: int, form: str, costs: Dict[str, float],
                             pj_of_word: Dict[int, List[int]], L: int,
@@ -1564,6 +1720,11 @@ class SessionEngine:
                         if (e_h and p_l) or (e_l and p_h):
                             out.append(Issue("tajweed", "tafkheem", note_tafkheem(el, e_h), conf, 0, elab, plab, el))
                             flagged = True
+                if (lv in SIFA_AR and elab != plab and not flagged and el in BASIC_LETTERS
+                        and conf >= max(self.preset.conf_sifat, 0.8)):
+                    out.append(Issue("tajweed", "sifa:" + lv, note_sifa(lv, el), conf, 0, elab, plab, el))
+                    flagged = True
+                    trace.append([el, lv, elab, plab, round(conf, 3), True])
                 interesting = (lv == "tafkheem_or_taqeeq" and elab != plab) or \
                               (lv != "tafkheem_or_taqeeq" and (pos(elab, "moqalqal") or pos(plab, "moqalqal")
                                                                  or pos(elab, "maghnoon") or pos(plab, "maghnoon")))
@@ -1668,23 +1829,35 @@ class SessionEngine:
 
 
 def run_offline(ref: RefAya, recognize: Callable[[np.ndarray], Recognition], preset: Preset,
-                wave_f32: np.ndarray, hop_s: float = 0.5) -> Dict[str, Any]:
-    """Replays a finished recording through the same streaming engine (used by /analyze and tests)."""
+                wave_f32: np.ndarray, hop_s: Optional[float] = None) -> Dict[str, Any]:
+    """Judges a finished recording with the same engine. By default the whole recording is handed over
+    at once, so it is processed as a few long windows (about 1.15x the audio) instead of many short ones."""
     eng = SessionEngine(ref, recognize, preset, meta={"mode": "offline"})
-    hop = int(hop_s * SR)
-    for s in range(0, len(wave_f32), hop):
-        eng.add_audio(wave_f32[s:s + hop])
-        while eng.ready_to_run():
+    if hop_s is None:
+        eng.add_audio(wave_f32)
+        while eng.ready_to_run() and not eng.complete:
             eng.step()
+    else:
+        hop = int(hop_s * SR)
+        for s in range(0, len(wave_f32), hop):
+            eng.add_audio(wave_f32[s:s + hop])
+            while eng.ready_to_run() and not eng.complete:
+                eng.step()
             if eng.complete:
                 break
-        if eng.complete:
-            break
     msg = eng.flush()
-    msg["debug"] = eng.debug
+    msg["debug"] = compact_debug(eng)
     return msg
 
 
+def compact_debug(eng: "SessionEngine", steps: int = 60) -> Dict[str, Any]:
+    """Small, complete technical report: one entry per judged word + a thin step list (fits in a chat)."""
+    d = {k: v for k, v in eng.debug.items() if k != "steps"}
+    d["words"] = [eng.word_log[w] for w in sorted(eng.word_log)]
+    d["steps"] = [{"seq": s.get("seq"), "win_s": s.get("win_s"), "pred": s.get("pred"),
+                   "tracked": s.get("tracked"), "cursor": s.get("cursor_out"), "ok": s.get("quality_ok")}
+                  for s in eng.debug.get("steps", [])][-steps:]
+    return d
 # ==============================================================================
 # Audio decoding helpers
 # ==============================================================================
@@ -1785,6 +1958,7 @@ class ModelRuntime:
                 ref = None                                          # retried at the first session
             if self.device == "cpu" and ref is not None:
                 self._tune_precision(m, ref)
+            self.diag["internals"] = self._probe_internals(m)
             self.muaalem = m
             self.load_seconds = round(time.time() - t0, 1)
 
@@ -1813,6 +1987,31 @@ class ModelRuntime:
                 return (time.time() - t) / seconds
         except Exception:
             return None
+
+    def _probe_internals(self, m: Any) -> Dict[str, Any]:
+        """Records (never uses) the shape of the library internals, so a future version can read CTC
+        timings / logit margins safely. Any failure is only recorded."""
+        info: Dict[str, Any] = {}
+        try:
+            import torch
+            model, proc = getattr(m, "model", None), getattr(m, "processor", None)
+            info.update({"has_model": model is not None, "has_processor": proc is not None,
+                         "model_class": type(model).__name__})
+            if model is not None and proc is not None:
+                rng = np.random.default_rng(1)
+                feats = proc([(rng.standard_normal(SR * 2) * 0.03).astype(np.float32)],
+                             sampling_rate=SR, return_tensors="pt")
+                info["feature_shapes"] = {k: list(v.shape) for k, v in feats.items()}
+                with torch.inference_mode():
+                    out = model(**feats, return_dict=False)
+                o0 = out[0] if isinstance(out, (tuple, list)) else out
+                if isinstance(o0, dict):
+                    info["logit_levels"] = {str(k): list(v.shape) for k, v in o0.items()}
+                else:
+                    info["output_type"] = type(o0).__name__
+        except Exception as exc:
+            info["error"] = repr(exc)[:200]
+        return info
 
     def _tune_precision(self, m: Any, ref: RefAya) -> None:
         """Keeps fp32 when the CPU is fast enough; otherwise tries dynamic int8 (and keeps it only
@@ -1894,7 +2093,7 @@ class ModelRuntime:
     def status(self) -> Dict[str, Any]:
         return {
             "status": "ok" if self.muaalem is not None else ("error" if self.load_error else "loading"),
-            "engine": "rafiq-v14.2", "model": MODEL_ID, "device": self.device, "int8": self.int8,
+            "engine": "rafiq-v14.4", "model": MODEL_ID, "device": self.device, "int8": self.int8,
             "bench_rtf_fp32": self.bench_rtf, "bench_rtf_int8": self.bench_rtf_int8,
             "load_seconds": self.load_seconds, "load_error": self.load_error, "diag": self.diag,
             "refs": [{"sura": k[0], "aya": k[1], "words": v.n, "approx": v.approx,
@@ -1906,12 +2105,13 @@ class ModelRuntime:
 RUNTIME = ModelRuntime()
 
 
-def debug_snapshot(eng: "SessionEngine", runtime: ModelRuntime, steps: int = 40) -> Dict[str, Any]:
+def debug_snapshot(eng: "SessionEngine", runtime: ModelRuntime, steps: int = 60) -> Dict[str, Any]:
     """Compact trace of a session, sent with the final message (the server may scale to zero right
     after a session, so the app keeps its own copy for the 'technical report' button)."""
-    d = dict(eng.debug)
-    d["steps"] = list(d.get("steps", []))[-steps:]
-    d["server"] = runtime.status()
+    d = compact_debug(eng, steps)
+    srv = runtime.status()
+    d["server"] = {k: srv.get(k) for k in ("status", "engine", "device", "int8", "bench_rtf_fp32",
+                                           "load_seconds", "diag") if k in srv}
     return d
 
 
@@ -1960,6 +2160,7 @@ def build_fastapi_app(runtime: ModelRuntime = RUNTIME):
         ref = await asyncio.to_thread(runtime.get_ref, sura_idx, aya_idx)
         msg = await asyncio.to_thread(
             run_offline, ref, lambda w: runtime.recognize(w, ref), get_preset(strictness), wave_arr)
+        msg["debug"]["server"] = {k: runtime.status().get(k) for k in ("status", "engine", "device", "int8")}
         return JSONResponse(msg)
 
     @api.websocket("/ws/live-recitation")

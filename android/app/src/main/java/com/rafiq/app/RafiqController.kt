@@ -60,6 +60,8 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
         private set
     var strictness by mutableStateOf(RecitationConfig.getStrictness(appContext))
         private set
+    var mode by mutableStateOf(RecitationConfig.getMode(appContext))
+        private set
 
     private var session: RecitationSession? = null
     private var player: MediaPlayer? = null
@@ -72,6 +74,7 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
     private var silentMs = 0
     private var smoothedLevel = 0f
     private var lastDebug = ""
+    private var sessionBatch = false
     private val reports = ArrayList<String>()
     private val finalTimeout = Runnable { onFinalTimeout() }
 
@@ -127,12 +130,20 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
         if (stage == Stage.STARTING || stage == Stage.LISTENING || stage == Stage.FINISHING) return
         stopReference()
         resetRun()
-        val s = RecitationSession(appContext, strictness, this)
+        val batch = mode == "batch"
+        sessionBatch = batch
+        val s = RecitationSession(appContext, strictness, batch, this)
         if (!s.start()) {
             message = "تعذّر تشغيل الميكروفون. تأكد من منح الإذن."
             return
         }
         session = s
+        if (batch) {                              // تسجيل محلي ثم تحليل دفعة واحدة: لا حاجة للخادم أثناء التلاوة
+            stage = Stage.LISTENING
+            glow = -1
+            message = "سجّل تلاوتك كاملة ثم اضغط ⏹ ليُحلَّل التسجيل"
+            return
+        }
         val warm = serverState == 1
         stage = Stage.STARTING
         glow = -1
@@ -144,11 +155,11 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
         val s = session ?: return
         if (stage != Stage.LISTENING) return
         stage = Stage.FINISHING
-        message = "جارٍ إعداد النتيجة…"
+        message = if (mode == "batch") "جارٍ تحليل التسجيل… قد يستغرق حتى دقيقة" else "جارٍ إعداد النتيجة…"
         level = 0f
         s.stop()
         main.removeCallbacks(finalTimeout)
-        main.postDelayed(finalTimeout, 150000L)
+        main.postDelayed(finalTimeout, 220000L)
     }
 
     /** المستخدم ضغط الميكروفون أثناء انتظار الخادم: نلغي البدء. */
@@ -293,7 +304,7 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
     }
 
     private fun updateGlow() {
-        if (stage != Stage.LISTENING) return
+        if (stage != Stage.LISTENING || sessionBatch) return
         val last = words.size - 1
         val base = max(0, max(serverTracked, serverCommitted)).coerceAtMost(last)
         val s = session
@@ -320,6 +331,11 @@ class RafiqController(private val appContext: Context) : RecitationSession.Liste
             }
         }
         return Summary(ok, ta, tj, le, un, ok + ta + tj + le + un, words.size)
+    }
+
+    fun changeMode(value: String) {
+        RecitationConfig.saveMode(appContext, value)
+        mode = value
     }
 
     fun changeStrictness(value: String) {

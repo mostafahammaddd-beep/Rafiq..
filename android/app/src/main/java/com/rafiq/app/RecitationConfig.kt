@@ -16,6 +16,7 @@ object RecitationConfig {
     private const val PREFS_NAME = "rafiq_prefs_v14"
     private const val KEY_URL = "server_url"
     private const val KEY_STRICT = "strictness"
+    private const val KEY_MODE = "mode"
 
     fun getServerBaseUrl(ctx: Context): String {
         val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -45,13 +46,27 @@ object RecitationConfig {
             .apply()
     }
 
+    /** batch = سجّل ثم حلّل (أرخص، الافتراضي) | live = تلوين لحظي أثناء التلاوة */
+    fun getMode(ctx: Context): String {
+        val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val m = prefs.getString(KEY_MODE, "batch") ?: "batch"
+        return if (m == "live") "live" else "batch"
+    }
+
+    fun saveMode(ctx: Context, value: String) {
+        ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_MODE, value)
+            .apply()
+    }
+
     fun normalizeBaseUrl(url: String): String {
         var u = url.trim().trimEnd('/')
         if (u.isEmpty()) return BACKEND_BASE_URL
         if (u.startsWith("wss://")) u = "https://" + u.removePrefix("wss://")
         if (u.startsWith("ws://")) u = "http://" + u.removePrefix("ws://")
         if (!u.startsWith("http://") && !u.startsWith("https://")) u = "https://$u"
-        u = u.removeSuffix("/ws/live-recitation").removeSuffix("/health").trimEnd('/')
+        u = u.removeSuffix("/ws/live-recitation").removeSuffix("/analyze").removeSuffix("/health").trimEnd('/')
         return u
     }
 
@@ -69,6 +84,8 @@ object RecitationConfig {
     fun isMetered(ctx: Context): Boolean = getServerBaseUrl(ctx).contains("modal.run")
 
     fun healthUrl(ctx: Context): String = getServerBaseUrl(ctx) + "/health"
+
+    fun analyzeUrl(ctx: Context): String = getServerBaseUrl(ctx) + "/analyze"
 
     fun debugUrl(ctx: Context): String = getServerBaseUrl(ctx) + "/debug/last?steps=30"
 }

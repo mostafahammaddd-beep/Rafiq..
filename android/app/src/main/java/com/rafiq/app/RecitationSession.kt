@@ -7,14 +7,20 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Handler
 import android.os.Looper
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString.Companion.toByteString
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.TimeUnit
 import kotlin.math.max
 import kotlin.math.sqrt
@@ -43,6 +49,7 @@ object Net {
 class RecitationSession(
     private val appContext: Context,
     private val strictness: String,
+    private val batch: Boolean,
     private val listener: Listener
 ) {
     interface Listener {
@@ -100,7 +107,11 @@ class RecitationSession(
         }
         record = rec
         capturing = true
-        connect()                     // الالتقاط يبدأ عند وصول «ready» من الخادم (انظر beginCapture)
+        if (batch) {
+            beginCapture()            // التسجيل محلي بالكامل؛ يُرسل مرة واحدة عند الإيقاف
+        } else {
+            connect()                 // الالتقاط يبدأ عند وصول «ready» من الخادم (انظر beginCapture)
+        }
         return true
     }
 
@@ -248,8 +259,84 @@ class RecitationSession(
             } catch (_: Exception) {
             }
             captureDone = true
-            pump()
+            if (batch) uploadBatch() else pump()
         }
+    }
+
+    // ------------------------------------------------------------------ وضع «سجّل ثم حلّل»
+
+    private fun buildWav(pcm: ByteArray, sampleRate: Int): ByteArray {
+        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+        header.put("RIFF".toByteArray())
+        header.putInt(36 + pcm.size)
+        header.put("WAVE".toByteArray())
+        header.put("fmt ".toByteArray())
+        header.putInt(16)
+        header.putShort(1)                 // PCM
+        header.putShort(1)                 // mono
+        header.putInt(sampleRate)
+        header.putInt(sampleRate * 2)
+        header.putShort(2)
+        header.putShort(16)
+        header.put("data".toByteArray())
+        header.putInt(pcm.size)
+        return header.array() + pcm
+    }
+
+    /** يرسل التسجيل كاملاً (بعد بوابة الصمت) إلى /analyze ويقرأ النتيجة النهائية نفسها التي يرسلها البث. */
+    private fun uploadBatch() {
+        if (finished) return
+        val pcm = synchronized(lock) {
+            val bos = ByteArrayOutputStream()
+            for (c in chunks) bos.write(c)
+            bos.toByteArray()
+        }
+        if (pcm.size < RecitationConfig.SAMPLE_RATE * 2) {      // أقل من ثانية من الصوت
+            finished = true
+            main.post { listener.onFinal(ArrayList<WordResult>(), false, "") }
+            return
+        }
+        val wav = buildWav(pcm, RecitationConfig.SAMPLE_RATE)
+        val url = RecitationConfig.analyzeUrl(appContext)
+        val client = Net.client.newBuilder()
+            .readTimeout(180, TimeUnit.SECONDS)
+            .writeTimeout(120, TimeUnit.SECONDS)
+            .build()
+        var attempt = 0
+        while (attempt < 3 && !finished) {
+            attempt += 1
+            try {
+                val body = MultipartBody.Builder()
+                    .setType(MultipartBody.FORM)
+                    .addFormDataPart("sura_idx", RecitationConfig.SURA_IDX.toString())
+                    .addFormDataPart("aya_idx", RecitationConfig.AYA_IDX.toString())
+                    .addFormDataPart("strictness", strictness)
+                    .addFormDataPart("file", "recitation.wav", wav.toRequestBody("audio/wav".toMediaType()))
+                    .build()
+                val req = Request.Builder().url(url).post(body).build()
+                client.newCall(req).execute().use { r ->
+                    val text = r.body?.string() ?: ""
+                    if (r.isSuccessful) {
+                        val o = JSONObject(text)
+                        val words = parseWords(o.optJSONArray("words"))
+                        val complete = o.optJSONObject("summary")?.optBoolean("complete", false) ?: false
+                        val debugText = o.optJSONObject("debug")?.toString() ?: ""
+                        finished = true
+                        main.post { listener.onFinal(words, complete, debugText) }
+                        return
+                    }
+                }
+            } catch (e: Exception) {
+                // نعيد المحاولة أدناه
+            }
+            if (!finished && attempt < 3) {
+                try {
+                    Thread.sleep(3000L * attempt)
+                } catch (_: InterruptedException) {
+                }
+            }
+        }
+        if (!finished) fatal("تعذّر إرسال التسجيل للتحليل. تأكد من الإنترنت ثم أعد المحاولة.")
     }
 
     // ------------------------------------------------------------------ الشبكة

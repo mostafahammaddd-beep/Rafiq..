@@ -9,8 +9,8 @@ android {
         applicationId = "com.rafiq.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 16
-        versionName = "14.3"
+        versionCode = 17
+        versionName = "14.4"
     }
     signingConfigs {
         getByName("debug") {

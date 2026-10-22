@@ -87,6 +87,10 @@ class FakeLib:
     def phonetize(self, text, remove_spaces):
         toks = [t for t in text.split() if M._BASE_RE.search(t)]
         words = [lib_word(w, i == len(toks) - 1, i == 0) for i, w in enumerate(toks)]
+        for i in range(len(toks) - 1):             # idgham across the junction: tanween nun merges into the next letter
+            if toks[i][-1] in TANWEEN and words[i].endswith("ن") and words[i + 1] and words[i + 1][0] in "لرمنوي":
+                words[i] = words[i][:-1]
+                words[i + 1] = words[i + 1][0] + words[i + 1]
         if remove_spaces:
             ph = "".join(words)
         elif self.spaced == "none":
@@ -118,6 +122,7 @@ def fake_groups(ph: str):
             qalqla="moqalqal" if letter in "قطبجد" else "not_moqalqal",
             tafkheem_or_taqeeq="mofakham" if letter in "صضطظقغخر" else "moraqaq",
             ghonna="maghnoon" if letter in "نم" else "not_maghnoon",
+            hams_or_jahr="hams" if letter in "فحثهشخصسكت" else "jahr",
         ))
     return out
 

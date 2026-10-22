@@ -42,7 +42,11 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val c = RafiqController(applicationContext)
         controller = c
-        if (RecitationConfig.isMetered(applicationContext)) c.markSleeping() else c.warmUp()
+        if (RecitationConfig.getMode(applicationContext) == "batch" || RecitationConfig.isMetered(applicationContext)) {
+            c.markSleeping()
+        } else {
+            c.warmUp()
+        }
         setContent {
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
                 RafiqApp(c)
@@ -131,16 +135,20 @@ fun RafiqApp(c: RafiqController) {
 fun TopBar(c: RafiqController, onSettings: () -> Unit) {
     val statusText: String
     val chipColor: Color
-    when (c.serverState) {
-        1 -> {
+    when {
+        c.mode == "batch" -> {
+            statusText = "💤 يُحلَّل بعد التسجيل"
+            chipColor = Cream
+        }
+        c.serverState == 1 -> {
             statusText = "● الخادم جاهز"
             chipColor = GreenOk
         }
-        2 -> {
+        c.serverState == 2 -> {
             statusText = "⚠ لا اتصال بالخادم (اضغط)"
             chipColor = RedLetters
         }
-        3 -> {
+        c.serverState == 3 -> {
             statusText = "⏸ الخادم نائم — اضغط لإيقاظه"
             chipColor = Cream
         }
@@ -170,7 +178,7 @@ fun TopBar(c: RafiqController, onSettings: () -> Unit) {
             fontSize = 12.sp,
             modifier = Modifier
                 .clip(RoundedCornerShape(50))
-                .clickable(enabled = c.serverState == 2 || c.serverState == 3) { c.retryServer() }
+                .clickable(enabled = c.mode != "batch" && (c.serverState == 2 || c.serverState == 3)) { c.retryServer() }
                 .padding(horizontal = 8.dp, vertical = 4.dp)
         )
         Spacer(Modifier.width(4.dp))
@@ -565,6 +573,28 @@ fun StrictChip(label: String, value: String, c: RafiqController, modifier: Modif
 }
 
 @Composable
+fun ModeChip(label: String, value: String, c: RafiqController, modifier: Modifier) {
+    val selected = c.mode == value
+    val shape = RoundedCornerShape(10.dp)
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .clip(shape)
+            .background(if (selected) Gold else Bg)
+            .border(1.dp, Gold.copy(alpha = 0.6f), shape)
+            .clickable { c.changeMode(value) }
+            .padding(vertical = 8.dp, horizontal = 4.dp)
+    ) {
+        Text(
+            label,
+            color = if (selected) Bg else Cream,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
+
+@Composable
 fun SettingsDialog(c: RafiqController, onDismiss: () -> Unit) {
     val ctx = LocalContext.current
     var urlInput by remember { mutableStateOf(RecitationConfig.getServerBaseUrl(ctx)) }
@@ -584,6 +614,17 @@ fun SettingsDialog(c: RafiqController, onDismiss: () -> Unit) {
                 Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                Text("طريقة التحليل", color = Gold, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    ModeChip("بعد التسجيل (أرخص)", "batch", c, Modifier.weight(1f))
+                    ModeChip("مباشر (لحظي)", "live", c, Modifier.weight(1f))
+                }
+                Text(
+                    if (c.mode == "batch") "تُسجَّل التلاوة كاملة ثم تُحلَّل دفعة واحدة: أرخص بكثير ولا يحتاج الخادم أثناء التلاوة، لكن دون تلوين لحظي."
+                    else "تلوين الكلمات أثناء التلاوة، لكنه أغلى لأن الخادم يبقى يعمل طوال التلاوة.",
+                    color = Cream.copy(alpha = 0.85f),
+                    fontSize = 12.sp
+                )
                 Text("درجة الدقة", color = Gold, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     StrictChip("متساهل", "relaxed", c, Modifier.weight(1f))
